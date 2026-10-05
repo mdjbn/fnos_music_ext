@@ -44,6 +44,8 @@ try:
     from . import netease_auth
     from . import playlists
     from . import netease_items
+    from . import trimgw
+    from . import pushplus
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
     from .version import get_version
@@ -57,6 +59,8 @@ except ImportError:  # uvicorn --app-dir proxy
     import netease_auth  # type: ignore
     import playlists  # type: ignore
     import netease_items  # type: ignore
+    import trimgw  # type: ignore
+    import pushplus  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
@@ -1395,24 +1399,121 @@ def reset_music_db_cache_for_test() -> None:
     _MUSIC_DB_RESOLVED.clear()
 
 
+def _db_library_dirs() -> "list[str]":
+    """从飞牛 music.db 的 shared_library 表读曲库目录（纯候选，不做任何回退）。"""
+    db = resolve_music_db()
+    if not db or not os.path.exists(db):
+        logger.warning("曲库目录无法确定：music.db 不存在（%s），且未配置 FNMUSIC_LIBRARY_DIR", db)
+        return []
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
+        finally:
+            con.close()
+    except Exception as e:
+        logger.warning("Failed to read shared_library path: %s", e)
+        return []
+    out = [str(p) for p, in rows if p and os.path.isdir(str(p))]
+    if not out:
+        logger.warning("music.db 里没有可用的共享库路径（shared_library 行数=%d）: %s",
+                       len(rows), db)
+    return out
+
+
+def _authorized_dirs() -> "list[str]":
+    """飞牛**正式授权**给本应用的目录（开放网关 + 兼容环境变量）。
+
+    W13 移植自 gzywd v2.9.4：以前靠 root 硬读 /vol1/...，既不合飞牛规范，
+    也让管理员在应用设置里看不到「授权目录」入口、没法合规授权。现在先问网关
+    「我被授权了哪些目录」，再用这些目录当曲库来源。
+    """
+    try:
+        rep = trimgw.authorized_report()
+    except Exception as exc:  # noqa: BLE001 - 查授权失败绝不能拖垮主流程
+        logger.warning("查询飞牛授权目录失败: %s: %s", type(exc).__name__, exc)
+        return []
+    paths = rep.get("shared_paths") or []
+    if not paths:
+        logger.warning("飞牛尚未给 %s 授权任何目录：%s",
+                       trimgw.app_name(), rep.get("hint") or rep.get("shared_error") or "")
+    return list(paths)
+
+
+def _strict_authorization() -> bool:
+    """true = 只扫已授权目录，绝不依赖 root 直读未授权路径（合规最严档）。"""
+    return (os.environ.get("FNMUSIC_STRICT_AUTHORIZATION") or "false").strip().lower() in (
+        "true", "1", "yes", "on")
+
+
+def library_authorization_state(path: str) -> dict:
+    """判断一个曲库目录当前是否处在飞牛授权范围内（供诊断/日志使用）。"""
+    try:
+        rep = trimgw.authorized_report()
+    except Exception as exc:  # noqa: BLE001
+        return {"authorized": False, "paths": [], "hint": f"查询失败: {exc}"}
+    paths = rep.get("shared_paths") or []
+    covered = bool(path) and any(
+        os.path.abspath(path) == os.path.abspath(a)
+        or os.path.abspath(path).startswith(os.path.abspath(a).rstrip(os.sep) + os.sep)
+        for a in paths
+    )
+    return {
+        "authorized": covered,
+        "paths": paths,
+        "hint": rep.get("hint") or "",
+        "error": rep.get("shared_error") or "",
+    }
+
+
 def detect_library_dir() -> str:
-    """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
+    """定位本地曲库目录。
+
+    W13 移植自 gzywd v2.9.4，优先级：
+    **管理页显式配置** → **飞牛正式授权目录** → music.db 的 shared_library
+    → 最后才回退到 cache_dir。
+
+    A 侧原本只有 显式配置 → shared_library → cache_dir 三段。补授权目录这一档
+    是因为回退到 cache_dir 属「静默失效」：那里一首歌都没有，于是本地曲库优先、
+    本地每日推荐全都表现成「功能没开」而不是「路径错了」——所以每次回退都要把
+    原因写进日志。
+    """
     explicit = str(CONF.get("library_dir") or "").strip()
     if explicit:
+        if not os.path.isdir(explicit):
+            logger.warning("FNMUSIC_LIBRARY_DIR 配置了但目录不存在: %s", explicit)
+        else:
+            st = library_authorization_state(explicit)
+            if not st["authorized"]:
+                logger.warning(
+                    "曲库目录 %s 不在飞牛授权范围内（当前靠 root 直读）。"
+                    "建议到「应用设置 → 授权目录」把它授权给本应用：%s",
+                    explicit, st.get("hint") or "尚未授权任何目录",
+                )
         return explicit
-    db = str(CONF.get("music_db") or "")
-    if db and os.path.exists(db):
-        try:
-            con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-            try:
-                rows = con.execute("SELECT path FROM shared_library ORDER BY id").fetchall()
-            finally:
-                con.close()
-            for (path,) in rows:
-                if path and os.path.isdir(path):
-                    return path
-        except Exception as e:
-            logger.warning("Failed to read shared_library path: %s", e)
+
+    authorized = _authorized_dirs()
+    if authorized:
+        db_dirs = _db_library_dirs()
+        picked = trimgw.pick_library_from_authorized(db_dirs, authorized)
+        if picked:
+            logger.info("曲库目录取自飞牛已授权目录: %s", picked)
+            return picked
+        logger.info("曲库目录使用飞牛授权目录（music.db 未提供可用路径）: %s", authorized[0])
+        return authorized[0]
+
+    db_dirs = _db_library_dirs()
+    if db_dirs:
+        if _strict_authorization():
+            logger.warning("FNMUSIC_STRICT_AUTHORIZATION=true，拒绝使用未授权目录 %s", db_dirs[0])
+        else:
+            logger.warning("飞牛未授权任何目录，暂按 music.db 路径 %s 读取（建议到应用设置授权）",
+                           db_dirs[0])
+            return db_dirs[0]
+
+    logger.warning("曲库目录无法确定：既没有飞牛授权目录，music.db 也不可用，"
+                   "且未配置 FNMUSIC_LIBRARY_DIR；回退到 %s（空目录，本地曲库优先不会命中）",
+                   CONF["cache_dir"])
     return CONF["cache_dir"]
 
 
@@ -3178,16 +3279,27 @@ async def lifespan(fastapi_app: FastAPI):
         created_cdn = True
 
     # W6：频道歌单缓存定时刷新（同 G，仅在真实服务环境 + 网易云启用时启动）。
-    # A 侧不启动 netease_auth 登录态轮询（那是 W9/admin 的职责），只跑歌单刷新。
     stop_event = asyncio.Event()
     refresh_task: asyncio.Task | None = None
+    auth_task: asyncio.Task | None = None
     if _background_jobs_enabled() and CONF.get("netease_enabled"):
         refresh_task = asyncio.create_task(_playlist_refresh_loop(fastapi_app, stop_event))
+        # W13：登录态巡检（掉线 / VIP 临期 → PushPlus 提醒），与 G 的 lifespan 一致。
+        # pushplus.send(None, ...) 内部会自建 httpx 客户端（proxy/pushplus.py:263），
+        # 所以不需要 app.state.push_client；巡检失败绝不能拖垮主链路启动。
+        try:
+            auth_task = netease_auth.start_watch(fastapi_app.state.musicbox_client, stop_event)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("启动网易云登录态巡检失败: %s: %s", type(exc).__name__, exc)
 
     try:
         yield
     finally:
         stop_event.set()
+        if auth_task is not None:
+            netease_auth.stop_watch()
+            auth_task.cancel()
+            await asyncio.gather(auth_task, return_exceptions=True)
         if refresh_task is not None:
             refresh_task.cancel()
             await asyncio.gather(refresh_task, return_exceptions=True)
@@ -3279,6 +3391,56 @@ async def ext_prefetch_report():
     try:
         return {"ok": True, "data": prefetch.status()}
     except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/authorized")
+async def ext_authorized(request: Request):
+    """飞牛「应用授权目录」状态快照（W13 移植 G v2.9.4）。
+
+    把「网关在不在 / token 有没有 / 授权了哪些目录 / 当前曲库是否覆盖」一次摊开，
+    管理页据此提示去哪里点授权。只读；``refresh=1`` 才强制重探网关。
+    """
+    try:
+        if request.query_params.get("refresh") in ("1", "true", "yes"):
+            trimgw.invalidate_cache()
+        rep = trimgw.authorized_report(force=request.query_params.get("refresh") in ("1", "true", "yes"))
+        lib = detect_library_dir()
+        rep["library_dir"] = lib
+        rep["library_is_cache_fallback"] = bool(lib) and os.path.abspath(lib) == os.path.abspath(
+            str(CONF["cache_dir"]))
+        rep["strict"] = _strict_authorization()
+        rep["env_share_paths"] = trimgw.env_share_paths()
+        return {"ok": True, "data": rep}
+    except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        logger.warning("authorized diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/localfirst")
+async def ext_local_first():
+    """本地曲库优先的状态快照（W13 移植 G v2.9.14）。
+
+    这个模块之前最大的问题不是逻辑错，而是**无法自证**：索引空了、匹配没命中，
+    界面上一点迹象都没有，看起来就是「没做」。这里把索引构成、来源、最近查询
+    结果全部摊开。只读，不触发扫描。
+    """
+    try:
+        lib = detect_library_dir()
+        rep = local_library.status(resolve_music_db(), lib)
+        rep["policy_level"] = ""
+        rep["hint"] = ""
+        if not rep["enabled"]:
+            rep["hint"] = "已在管理页关闭「本地曲库优先」。"
+        elif not rep["entries"]:
+            rep["hint"] = ("索引是空的，本地优先永远不会命中：" + (rep["empty_reason"] or "")
+                           + "。请确认「本地曲库目录」填对、且已在应用设置里授权该目录。")
+        elif rep["lookups"] and not rep["lookup_hits"]:
+            rep["hint"] = ("索引有歌但一次都没匹配上——多半是标题写法对不上（网易云的标题"
+                           "带「(Live)」「- Remaster」等后缀）。把「最近查询」贴给开发者即可定位。")
+        return {"ok": True, "data": rep}
+    except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        logger.warning("local first diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
@@ -3459,6 +3621,8 @@ async def ext_healthz(request: Request):
     source_ok = any(statuses[name] == "ok" for name in ("musicdl", "musicbox", "lxmusic"))
     return {"ok": statuses["upstream"] == "ok" and source_ok, "version": get_version(),
             **statuses, "llm": "enabled" if dailyrec.llm_enabled() else "disabled",
+            # W13：掉线提醒通道状态（与 G 的 healthz 同字段名，供管理页展示）
+            "pushplus": "enabled" if pushplus.enabled() else "disabled",
             "recommend": {
                 "mode": "per-user: source-slot -> llm -> local-random",
                 "netease": bool(CONF.get("netease_enabled")),
