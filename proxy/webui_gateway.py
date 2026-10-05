@@ -9,6 +9,10 @@
 NAS 上选中的 .js 源脚本路径发来，由宿主侧（本进程，root）代读文件内容。
 该端点只在桌面网关链路里存在（直连 8774 不经过这里），并要求网关注入的
 X-Trim-Isadmin: true。其余请求一律原样转发，不动字节。
+
+另一个例外：``/app/fnmusic-ext/admin/...`` 转发给独立进程的管理界面
+（proxy/admin_ui_daemon.py 挂在 admin-ui Unix socket 上）。管理界面没起来时
+只有这个子路径回 503，WebUI 本身不受影响。
 """
 from __future__ import annotations
 
@@ -27,6 +31,12 @@ PID_FILE = Path("/run/fnmusic-ext/webui-gateway.pid")
 # 洛雪源校验要几十秒才有响应；沿用 5 秒会让桌面网关中途拆连接，nginx 回 502。
 CONNECT_TIMEOUT = 5
 RELAY_TIMEOUT = 180
+
+# 管理界面（proxy/admin_ui.py，独立进程）挂在本网关的 /admin 子路径下：
+# /app/fnmusic-ext/admin/... -> admin-ui Unix socket。FNMUSIC_ADMIN_PREFIX
+# 同时是 admin_ui.py 自己的前缀归一化配置，两边必须是同一个值。
+ADMIN_UI_SOCK = Path(os.environ.get("FNMUSIC_ADMIN_UI_SOCK") or "/run/fnmusic-ext/admin-ui.sock")
+ADMIN_UI_PREFIX = (os.environ.get("FNMUSIC_ADMIN_PREFIX") or "/app/fnmusic-ext/admin").rstrip("/")
 
 HOST_FILE_PATHS = ("/app/fnmusic-ext/api/host-file", "/api/host-file")
 HOST_FILE_MAX_BODY = 1 << 20          # 请求体上限 1MB（只装一个路径字符串）
@@ -195,6 +205,33 @@ def _is_host_file_request(head_raw: bytes) -> bool:
     return parts[1] in HOST_FILE_PATHS
 
 
+def _request_path(head_raw: bytes) -> str:
+    """取出请求行里的路径（含查询串）；解析失败返回空串。"""
+    try:
+        request_line = head_raw.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+    parts = request_line.split()
+    if len(parts) < 2:
+        return ""
+    return parts[1]
+
+
+def _is_admin_ui_request(head_raw: bytes) -> bool:
+    path = _request_path(head_raw)
+    return bool(path) and (path == ADMIN_UI_PREFIX or path.startswith(ADMIN_UI_PREFIX + "/"))
+
+
+def _connect(target) -> socket.socket:
+    """target 是 (host, port) 走 TCP；是 Path 走 Unix socket。"""
+    if isinstance(target, Path):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(CONNECT_TIMEOUT)
+        sock.connect(str(target))
+        return sock
+    return socket.create_connection(target, timeout=CONNECT_TIMEOUT)
+
+
 def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     head = _read_request_head(client)
     if head is None:
@@ -204,10 +241,17 @@ def _handle(client: socket.socket, upstream: tuple[str, int]) -> None:
     if _is_host_file_request(head_raw):
         handle_host_file(client, headers, head_raw)
         return
+    admin_ui = _is_admin_ui_request(head_raw)
     try:
-        remote = socket.create_connection(upstream, timeout=CONNECT_TIMEOUT)
+        remote = _connect(ADMIN_UI_SOCK if admin_ui else upstream)
         remote.settimeout(RELAY_TIMEOUT)
     except OSError:
+        # 管理界面是可选组件：没起来时只让这个子路径 503，不能影响 WebUI
+        if admin_ui:
+            try:
+                client.sendall(_json_response(503, {"ok": False, "error": "管理界面进程未运行"}))
+            except OSError:
+                pass
         client.close()
         return
     left = threading.Thread(target=_relay, args=(client, remote, head_raw), daemon=True)

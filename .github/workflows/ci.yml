@@ -47,6 +47,11 @@ jobs:
       - name: Python compile check
         run: >
           python -m py_compile proxy/app.py proxy/recommend.py proxy/env_merge.py proxy/version.py
+          proxy/admin_ui.py proxy/admin_ui_daemon.py proxy/webui_gateway.py proxy/playlists.py
+          proxy/prefetch.py proxy/quality.py proxy/local_library.py proxy/local_files.py
+          proxy/netease_auth.py proxy/netease_items.py proxy/pushplus.py proxy/download.py
+          proxy/trimgw.py proxy/loghouse.py proxy/cache_gc.py proxy/nmplaylists.py
+          proxy/takeover.py proxy/transcode.py
           lxmusic-service/app.py lxmusic-service/source_runtime.py lxmusic-service/verify_source.py
           musicdl-service/app.py musicdl-service/hardening.py
           musicbox-service/app.py musicbox-service/runner.py musicbox-service/netease_ext.py

@@ -71,6 +71,10 @@ class TestManifest:
         assert m["maintainer_url"].startswith("https://github.com/")
         # JS SDK（pickUserFile NAS 文件选择）要求微应用环境
         assert m["micro_app"] == "true"
+        # 应用中心用 cmd/main stop 优雅停止（ExecStopPost 才能还原官方 socket）
+        assert m["ctl_stop"] == "true"
+        # 允许在应用设置里配置授权目录（trimgw / 本地曲库依赖）
+        assert m["disable_authorization_path"] == "false"
 
     def test_version_matches_repo(self, stage: Path):
         m = _parse_manifest((stage / "manifest").read_text())
@@ -110,8 +114,10 @@ class TestConfig:
 
     def test_resource_is_json(self, stage: Path):
         resource = json.loads((stage / "config" / "resource").read_text())
-        # NAS 文件选择（pickUserFile）需要声明的开放 API scope
-        assert resource.get("api-scope") == ["trim.file.userAccess"]
+        scopes = resource.get("api-scope")
+        # NAS 文件选择（pickUserFile）要 userAccess；trimgw 读授权目录要 sharedAccess
+        assert "trim.file.userAccess" in scopes
+        assert "trim.file.sharedAccess" in scopes
 
 
 class TestWizard:

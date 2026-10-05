@@ -10,5 +10,7 @@ os_min_version        = 1.2.0
 install_dep_apps      = trim.music
 desktop_uidir         = ui
 desktop_applaunchname = fnmusic-ext.main
+ctl_stop              = true
 checkport             = false
+disable_authorization_path = false
 micro_app             = true

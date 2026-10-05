@@ -183,3 +183,76 @@ def test_host_file_only_post_intercepted(tmp_path: Path):
     upstream.shutdown()
     # 上游原样回显请求路径（未拦截）
     assert b"/app/fnmusic-ext/api/host-file" in data
+
+
+class _UnixUpstream:
+    """极简 Unix socket 上游：记下收到的请求，回一个固定标记。"""
+
+    def __init__(self, sock_path: Path, marker: bytes = b"admin-ui"):
+        self.path = sock_path
+        self.marker = marker
+        self.seen: "list[bytes]" = []
+        self._server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self._server.bind(str(sock_path))
+        self._server.listen(8)
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self) -> None:
+        while True:
+            try:
+                conn, _ = self._server.accept()
+            except OSError:
+                return
+            try:
+                data = conn.recv(65536)
+                self.seen.append(data)
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s"
+                    % (len(self.marker), self.marker)
+                )
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+    def close(self) -> None:
+        try:
+            self._server.close()
+        except OSError:
+            pass
+
+
+def test_admin_ui_subpath_goes_to_admin_socket(tmp_path: Path, monkeypatch):
+    """桌面网关的 /admin 子路径必须转到管理界面 socket，其余仍走 WebUI。"""
+    admin = _UnixUpstream(tmp_path / "admin-ui.sock")
+    monkeypatch.setattr(_MOD, "ADMIN_UI_SOCK", admin.path)
+    port = 0
+    upstream = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, upstream.server_address[1])
+
+    data = _request(sock_path, b"GET /app/fnmusic-ext/admin/api/health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"admin-ui" in data
+    assert b"/app/fnmusic-ext/admin/api/health" in admin.seen[0]
+
+    data = _request(sock_path, b"GET /app/fnmusic-ext/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"/app/fnmusic-ext/" in data and b"admin-ui" not in data
+
+    upstream.shutdown()
+    admin.close()
+
+
+def test_admin_ui_down_only_breaks_its_subpath(tmp_path: Path, monkeypatch):
+    """管理界面没起来时：/admin 回 503，WebUI 完全不受影响。"""
+    monkeypatch.setattr(_MOD, "ADMIN_UI_SOCK", tmp_path / "not-running.sock")
+    upstream = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=upstream.serve_forever, daemon=True).start()
+    sock_path = _start_gateway(tmp_path, upstream.server_address[1])
+
+    data = _request(sock_path, b"GET /app/fnmusic-ext/admin/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"503" in data.split(b"\r\n", 1)[0]
+    assert "管理界面进程未运行".encode() in data
+
+    data = _request(sock_path, b"GET /app/fnmusic-ext/ HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+    assert b"200" in data.split(b"\r\n", 1)[0]
+    upstream.shutdown()

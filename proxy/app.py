@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import glob
 import hashlib
 import math
 import json
@@ -37,6 +38,12 @@ try:
     from . import recommend as dailyrec
     from . import nmplaylists as nmpl
     from . import transcode as tc
+    from . import quality
+    from . import local_library
+    from . import prefetch
+    from . import netease_auth
+    from . import playlists
+    from . import netease_items
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
     from .version import get_version
@@ -44,11 +51,28 @@ except ImportError:  # uvicorn --app-dir proxy
     import recommend as dailyrec  # type: ignore
     import nmplaylists as nmpl  # type: ignore
     import transcode as tc  # type: ignore
+    import quality  # type: ignore
+    import local_library  # type: ignore
+    import prefetch  # type: ignore
+    import netease_auth  # type: ignore
+    import playlists  # type: ignore
+    import netease_items  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
 
 logger = logging.getLogger("fnmusic_proxy")
+
+
+def _env_float(name: str, default: float) -> float:
+    """W6：读浮点环境变量（G 侧 `_float` 的等价实现，A 原本没有）。"""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return default
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 _HOME = dailyrec.home_dir()
@@ -503,6 +527,17 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_VERIFY_TIMEOUT_S": ("", "str"),
     "FNMUSIC_REC_SEARCH_CONCURRENCY": ("", "str"),
     "FNMUSIC_REC_SEARCH_INTERVAL": ("", "str"),
+    # W3：动态音质决策 / 本地曲库优先（quality.py、local_library.py 直接读 os.environ）
+    "FNMUSIC_QUALITY_DYNAMIC": ("", "str"),
+    "FNMUSIC_QUALITY_POLICY": ("", "str"),
+    "FNMUSIC_QUALITY_FIXED": ("", "str"),
+    "FNMUSIC_QUALITY_WIFI": ("", "str"),
+    "FNMUSIC_QUALITY_CELLULAR": ("", "str"),
+    "FNMUSIC_REMOTE_AS_CELLULAR": ("", "str"),
+    "FNMUSIC_UNKNOWN_AS_CELLULAR": ("", "str"),
+    "FNMUSIC_LOCAL_FIRST": ("", "str"),
+    "FNMUSIC_LOCAL_FIRST_ANY_CLASS": ("", "str"),
+    "FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -681,6 +716,28 @@ ONLINE_TRIAL_MARKERS = (
 )
 
 
+def _has_trial_fragment(item: dict) -> bool:
+    """条目是否只是「试听片段」。
+
+    不能用 ``item.get("freeTrialInfo") or item.get("freeTrialPrivilege")`` 这种写法：
+    ``freeTrialPrivilege`` 是网易云**每条 song/url 响应都必带**的标准结构体，
+    正常曲目也一定存在且是非空 dict（真理值）。用它做真值判断会把**每一首歌**都判成
+    试听而剔除，与是否登录、是否 VIP 完全无关，表现为「搜不到任何在线歌曲」。
+    真正的信号在这个结构体**内部的布尔位**：``resConsumable`` / ``userConsumable``
+    为 True 才表示正在消耗试听额度。``freeTrialInfo`` 语义正好相反：None 表示无试听，
+    **只有确实是试听曲目才带非空内容**（形如 ``{"st": 起始秒, "et": 结束秒}``），
+    因此对它做存在性判断是安全的。两者混在一起做真值判断正是本 bug 的成因。
+    """
+    def flag(d, k):
+        v = d.get(k) if isinstance(d, dict) else None
+        return v is True or str(v).lower() == "true"
+
+    priv = item.get("freeTrialPrivilege")
+    if flag(priv, "resConsumable") or flag(priv, "userConsumable"):
+        return True
+    return bool(item.get("freeTrialInfo"))
+
+
 def is_playable_online_track(item: dict, require_id: bool = False, allow_paywall: bool = False) -> bool:
     """最终防线校验：过滤无音频流或试听标记的不可播曲目。"""
     if not isinstance(item, dict):
@@ -700,7 +757,7 @@ def is_playable_online_track(item: dict, require_id: bool = False, allow_paywall
         return False
 
     # 2. 字段试听标记
-    if item.get("is_trial") is True or item.get("freeTrialInfo") or item.get("freeTrialPrivilege"):
+    if item.get("is_trial") is True or _has_trial_fragment(item):
         return False
     if int(item.get("is_free_part") or 0) != 0 or int(item.get("fail_process") or 0) == 4:
         return False
@@ -1269,6 +1326,75 @@ def embed_audio_cover(path: str, data: bytes, mime: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# W3：music.db 自动定位（quality.py / local_library.py 的索引来源）
+#
+# 飞牛各版本把应用数据放在 /vol*/@appdata 下，层级并不统一；只在 trim.music 自己
+# 的目录里递归 glob（不扫音乐库大盘）。结果按「显式配置值」为键缓存：测试换
+# CONF["music_db"] 时键变了会自动重查，不必手动失效。
+# ---------------------------------------------------------------------------
+
+_MUSIC_DB_RESOLVED: dict[str, str] = {}
+
+
+def _music_db_candidates() -> list[str]:
+    """music.db 的候选路径（按优先级，去重保序）。"""
+    explicit = str(CONF.get("music_db") or "").strip()
+    cands: list[str] = []
+    if explicit:
+        cands.append(explicit)
+    cands.append("/usr/local/apps/@appdata/trim.music/db/music.db")
+    for pat in (
+        "/vol*/@appdata/trim.music/db/music.db",
+        "/vol*/@appdata/trim.music/*/db/music.db",
+        "/vol*/@appcenter/trim.music/db/music.db",
+        "/vol*/@appdata/trim.music/**/music.db",
+        "/usr/local/apps/@appdata/trim.music/**/music.db",
+    ):
+        try:
+            cands.extend(sorted(glob.glob(pat, recursive=True)))
+        except Exception:  # noqa: BLE001 - 单个 glob 表达式异常不该影响整体
+            continue
+    seen: set[str] = set()
+    out: list[str] = []
+    for c in cands:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def resolve_music_db() -> str:
+    """显式配置存在才用，否则在常见布局里探测；都没有则回退到显式值。"""
+    explicit = str(CONF.get("music_db") or "").strip()
+    cached = _MUSIC_DB_RESOLVED.get(explicit)
+    if cached is not None:
+        return cached
+
+    candidates = _music_db_candidates()
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            _MUSIC_DB_RESOLVED[explicit] = cand
+            if cand != explicit:
+                logger.info("music.db 自动定位成功: %s（显式配置=%r）", cand, explicit or "未配置")
+            return cand
+
+    resolved = explicit or (candidates[1] if len(candidates) > 1 else "")
+    _MUSIC_DB_RESOLVED[explicit] = resolved
+    if not os.path.isfile(resolved):
+        # 逐个列出候选与存在性：真机上「猜路径猜错」是本地曲库类功能静默失效的
+        # 头号原因，没有这份清单就只能靠用户去 SSH 上 ls。
+        logger.warning(
+            "music.db 未找到（本地曲库优先不可用）。已探测: %s",
+            "; ".join(f"{c}{'[存在]' if os.path.isfile(c) else '[缺失]'}" for c in candidates[:12]) or "无",
+        )
+    return resolved
+
+
+def reset_music_db_cache_for_test() -> None:
+    _MUSIC_DB_RESOLVED.clear()
+
+
 def detect_library_dir() -> str:
     """优先环境变量，否则读飞牛 music.db 的共享库路径，最后回退到仓库 cache/。"""
     explicit = str(CONF.get("library_dir") or "").strip()
@@ -1736,6 +1862,35 @@ def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+def _new_cdn_client() -> httpx.AsyncClient:
+    """进程级共享的 CDN 客户端（移植 G v2.9.30 的 `_new_cdn_client`）。
+
+    旧实现里 `_open_online_stream` 每个请求都新建一个 httpx.AsyncClient：一次播放
+    付一次 TCP+TLS 握手，下一首预热再付一次。改成共享客户端 + 有界连接池后，跨曲目
+    复用连接，预热才真正便宜。
+
+    超时沿用 A 的取值（read=60s）而不是 G 的扁平 30s：A 侧的长暂停容忍是既有取流
+    行为，收紧会改变播放语义。
+    """
+    return httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0),
+        follow_redirects=True,
+        limits=httpx.Limits(
+            max_connections=20,
+            max_keepalive_connections=10,
+            keepalive_expiry=30.0,
+        ),
+    )
+
+
+def get_cdn_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
+    client = getattr(fastapi_app.state, "cdn_client", None)
+    if client is None or client.is_closed:
+        client = _new_cdn_client()
+        fastapi_app.state.cdn_client = client
+    return client
+
+
 async def forward_to_upstream(request: Request, client: httpx.AsyncClient) -> Response:
     url_path = request.url.path
     if request.url.query:
@@ -2113,11 +2268,118 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
     return None
 
 
-async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | None:
-    primary = str(CONF.get("netease_quality") or "lossless").strip()
-    qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
-    if primary and primary not in qualities:
-        qualities.insert(0, primary)
+# W3：动态音质判定留痕。同一种 (level, source) 组合只记一次，避免整轨重试刷屏。
+_LOGGED_QUALITY: set[tuple[str, str]] = set()
+
+
+def _log_quality_decision(song_id: str, decision: dict) -> None:
+    key = (str(decision.get("level") or ""), str(decision.get("source") or ""))
+    if key in _LOGGED_QUALITY:
+        return
+    _LOGGED_QUALITY.add(key)
+    logger.info(
+        "音质判定 level=%s source=%s policy=%s network=%s (song=%s)",
+        key[0], key[1], decision.get("policy"), decision.get("network"), song_id,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 网易云直链短缓存（移植 G v2.9.30）
+# ---------------------------------------------------------------------------
+# 直链 URL 带签名、会过期，所以只缓存很短一段时间。TTL 与
+# `prefetch.warm_ttl_seconds()` 读同一个环境变量（且都在调用时读），保证
+# 「预热还算不算数」与「缓存还有没有效」不会出现两套口径——G 的
+# test_warm_ttl_follows_url_cache_not_a_magic_number 锁的就是这一点。
+_URL_CACHE: dict[str, tuple[float, str]] = {}
+
+
+def _url_cache_ttl() -> float:
+    try:
+        ttl = float(os.environ.get("FNMUSIC_URL_CACHE_TTL", "600") or 600.0)
+    except (TypeError, ValueError):
+        ttl = 600.0
+    return ttl if ttl > 0 else 600.0
+
+
+def _url_cache_max() -> int:
+    try:
+        return int(os.environ.get("FNMUSIC_URL_CACHE_MAX", "1000") or 1000)
+    except (TypeError, ValueError):
+        return 1000
+
+
+def _url_cache_get(song_id: str, level: str) -> str | None:
+    key = f"{song_id}:{level}"
+    entry = _URL_CACHE.get(key)
+    if not entry:
+        return None
+    ts, url = entry
+    if time.monotonic() - ts >= _url_cache_ttl():
+        _URL_CACHE.pop(key, None)
+        return None
+    return url
+
+
+def _url_cache_put(song_id: str, level: str, url: str) -> None:
+    _URL_CACHE[f"{song_id}:{level}"] = (time.monotonic(), url)
+    limit = _url_cache_max()
+    if limit > 0 and len(_URL_CACHE) > limit:
+        # 超限时按写入时间淘汰最旧的一半，避免无界增长。
+        for old in sorted(_URL_CACHE, key=lambda k: _URL_CACHE[k][0])[: max(1, limit // 2)]:
+            _URL_CACHE.pop(old, None)
+
+
+def _url_cache_peek(song_id: str) -> bool:
+    """该歌曲是否有任一档未过期的直链缓存（播放路径判断 warm 用）。"""
+    prefix = f"{song_id}:"
+    return any(_url_cache_get(song_id, key[len(prefix):]) for key in list(_URL_CACHE) if key.startswith(prefix))
+
+
+def _url_cache_drop_song(song_id: str) -> None:
+    prefix = f"{song_id}:"
+    for key in [k for k in _URL_CACHE if k.startswith(prefix)]:
+        _URL_CACHE.pop(key, None)
+
+
+def invalidate_url_cache() -> int:
+    n = len(_URL_CACHE)
+    _URL_CACHE.clear()
+    return n
+
+
+async def resolve_netease_url(client: httpx.AsyncClient, song_id: str,
+                             request: Any = None, stats: dict | None = None) -> str | None:
+    # 开关关闭（默认）时逐字节走 A 原有静态路径：netease_quality + quality_mode。
+    # 打开时才用 quality.resolve() 的动态档位。
+    if quality.dynamic_enabled():
+        decision = quality.resolve(request, db_path=resolve_music_db())
+        _log_quality_decision(song_id, decision)
+        primary = str(decision.get("level") or CONF.get("netease_quality") or "lossless").strip()
+        # 单次降档：档位已由 quality.resolve 定死，这里**不再**经 quality_mode /
+        # quality_order 二次降级（否则同一请求会被降两次）。只保留一个 exhigh
+        # 兜底重试，与 G 的行为一致。
+        qualities = [primary] if primary else []
+        if "exhigh" not in qualities:
+            qualities.append("exhigh")
+    else:
+        primary = str(CONF.get("netease_quality") or "lossless").strip()
+        qualities = quality_order(_NETEASE_QUALITY_LADDER, CONF.get("quality_mode"), primary)
+        if primary and primary not in qualities:
+            qualities.insert(0, primary)
+
+    # `stats` 非 None ⇒ 调用方是延迟敏感的播放/预热链路，启用直链短缓存，并把
+    # 「这次真的省掉了往返」标进 stats["url_cache_hit"]（prefetch.note_play 的 warm
+    # 唯一依据）。诊断/探活类调用不传 stats，永远走实时解析——A 既有的逐档降级
+    # 用例（test_netease/test_quality_policy/test_v2_features）都不传 stats，因此
+    # 逐档网络调用序列与旧行为逐字节一致。
+    use_cache = stats is not None
+    if use_cache:
+        for q in qualities:
+            cached = _url_cache_get(song_id, q)
+            if cached:
+                stats["url_cache_hit"] = True
+                stats["url_cache_quality"] = q
+                return cached
 
     for q in qualities:
         try:
@@ -2130,6 +2392,8 @@ async def resolve_netease_url(client: httpx.AsyncClient, song_id: str) -> str | 
                         code = inner.get("code")
                         url = inner.get("url")
                         if code == 200 and url:
+                            if use_cache:
+                                _url_cache_put(song_id, q, str(url))
                             return str(url)
         except Exception as e:
             logger.warning("resolve_netease_url error for %s (quality=%s): %s", song_id, q, e)
@@ -2669,6 +2933,114 @@ def stub_online_info(guid: str) -> dict:
     }
 
 
+def build_local_metadata_payload(guid: str, entry: dict) -> dict:
+    """本地曲目（local:file:…）的 metadata 应答。
+
+    形状对齐 ``build_metadata_payload``：飞牛客户端会无防护读 track.genres.join /
+    album / artists，缺字段直接抛错 → 播放器跳过、连 stream 都不请求。
+    duration 也必须给真值（早先恒为 0，客户端据此判定不可播）。
+    """
+    title = str(entry.get("title") or "") or _stem_of(entry.get("path"))
+    artist = str(entry.get("artist") or "")
+    album = str(entry.get("album") or "") or "本地曲库"
+    duration_s = float(entry.get("duration") or 0)
+    duration_ms = int(entry.get("duration_ms") or duration_s * 1000)
+    size = int(entry.get("size") or 0)
+    ext = str(entry.get("ext") or "mp3")
+    play_format = play_format_from_ext(ext)
+    artists = [{"name": artist, "guid": f"{guid}:artist"}] if artist else []
+    album_obj = {
+        "name": album,
+        "guid": f"{guid}:album",
+        "artists": artists,
+        "coverId": guid,
+    }
+    # ⚠️ 两处必须与在线曲目（build_online_track）严格一致，否则客户端拒绝播放：
+    #   1) duration 单位是**毫秒**（在线版 "duration": duration_ms）；
+    #      早期这里填秒，客户端把 240 读成 240 毫秒 → 判定不可播。
+    #   2) audioSpec.path 必须带真实后缀（"飞牛 ll() 用 path 解析 extension"）；
+    #      早期这里整个 audioSpec 是另起炉灶的简版，缺 path 就拿不到容器格式。
+    #
+    # v2.9.12：path 改用**真实绝对路径**（/vol1/.../许嵩 - 庐州月.flac），
+    # 不再用 local/<sha1>.<ext> 这种假路径。理由：
+    #   * 后缀照样真实，ll() 解析 extension 不受影响；
+    #   * 客户端「文件位置」显示的就是这个字段，假路径对用户毫无意义；
+    #   * 播放走 /track/stream 拦截（按 guid 反查路径），本来就不依赖它。
+    # 索引里万一没存路径，退回假路径保底，绝不留空（空 path = 拿不到容器格式）。
+    _sha = guid.split("local:file:", 1)[-1]
+    real_path = str(entry.get("path") or "")
+    spec_path = real_path or f"local/{_sha}.{play_format}"
+    audio_spec = {
+        "path": spec_path,   # 真实绝对路径（客户端「文件位置」显示的就是它）
+        "format": play_format,
+        "codec": play_format,
+        "container": play_format,
+        "duration": duration_ms,
+        "size": size,
+        "channel": int(entry.get("channels") or 2) or 2,
+        "sampleRate": int(entry.get("sample_rate") or 44100) or 44100,
+        "bitDepth": 16 if play_format in ("wav", "flac", "aiff") else None,
+        "bitrate": int(entry.get("bitrate") or 0)
+        or (1411000 if play_format in ("flac", "wav", "ape", "wv") else 320000),
+    }
+    audio_spec = {k: v for k, v in audio_spec.items() if v is not None}
+    track = {
+        "guid": guid,
+        "id": guid,
+        # 顶层也给一份真实路径：不同版本客户端读的字段不一样，
+        # audioSpec.path / path / filePath 都给上，哪个被读到都是真实路径。
+        "path": spec_path,
+        "filePath": real_path or spec_path,
+        "title": title,
+        "name": title,
+        "artist": artist,
+        "artists": artists,
+        "album": album_obj,
+        "albumName": album,
+        "audioSpec": audio_spec,
+        "duration": duration_ms,
+        "duration_ms": duration_ms,
+        "durationMs": duration_ms,
+        "duration_s": duration_s,
+        "codec": play_format,
+        "codecName": play_format,
+        "format": play_format,
+        "ext": ext,
+        "size": size,
+        "file_size": size,
+        "coverId": guid,
+        "cover_url": "",
+        "coverUrl": "",
+        "coverURL": "",
+        "source": "local",
+        "is_online": False,
+        "isFavorite": False,
+        "isCue": False,
+        "hasLyric": False,
+        "genres": [],
+        "accessStatus": 0,
+    }
+    return {
+        "code": 0,
+        "msg": "ok",
+        "data": {
+            **track,
+            "guid": guid,
+            "id": guid,
+            "album": album_obj,
+            "audioSpec": audio_spec,
+            "track": track,
+        },
+    }
+
+
+def _stem_of(path: str | None) -> str:
+    try:
+        return os.path.splitext(os.path.basename(str(path or "")))[0].strip()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def build_metadata_payload(guid: str, data: dict | None) -> dict:
     """飞牛 resolveTrackPlayback._h() 会无防护读取 data.track.genres.join / album / artists。
 
@@ -2766,6 +3138,7 @@ async def lifespan(fastapi_app: FastAPI):
     created_musicbox = False
     created_lx = False
     created_llm = False
+    created_cdn = False
 
     if getattr(fastapi_app.state, "upstream_client", None) is None:
         fastapi_app.state.upstream_client = httpx.AsyncClient(
@@ -2800,9 +3173,24 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.llm_client = httpx.AsyncClient(timeout=dailyrec.LLM_TIMEOUT_S)
         created_llm = True
 
+    if getattr(fastapi_app.state, "cdn_client", None) is None:
+        fastapi_app.state.cdn_client = _new_cdn_client()
+        created_cdn = True
+
+    # W6：频道歌单缓存定时刷新（同 G，仅在真实服务环境 + 网易云启用时启动）。
+    # A 侧不启动 netease_auth 登录态轮询（那是 W9/admin 的职责），只跑歌单刷新。
+    stop_event = asyncio.Event()
+    refresh_task: asyncio.Task | None = None
+    if _background_jobs_enabled() and CONF.get("netease_enabled"):
+        refresh_task = asyncio.create_task(_playlist_refresh_loop(fastapi_app, stop_event))
+
     try:
         yield
     finally:
+        stop_event.set()
+        if refresh_task is not None:
+            refresh_task.cancel()
+            await asyncio.gather(refresh_task, return_exceptions=True)
         tasks = [entry["task"] for entry in _SEARCH_CACHE.values() if entry.get("task") and not entry["task"].done()]
         for task in tasks:
             task.cancel()
@@ -2833,6 +3221,9 @@ async def lifespan(fastapi_app: FastAPI):
         if created_llm and getattr(fastapi_app.state, "llm_client", None):
             await fastapi_app.state.llm_client.aclose()
             fastapi_app.state.llm_client = None
+        if created_cdn and getattr(fastapi_app.state, "cdn_client", None):
+            await fastapi_app.state.cdn_client.aclose()
+            fastapi_app.state.cdn_client = None
 
 
 app = FastAPI(title="fnmusic-ext", lifespan=lifespan)
@@ -2855,6 +3246,176 @@ async def log_client_requests(request: Request, call_next):
             ua,
         )
     return response
+
+
+@app.middleware("http")
+async def observe_quality_signals(request: Request, call_next):
+    """W3 接线：动态音质打开时，被动观察 /music/api/ 请求里的网络/音质线索。
+
+    默认关闭时这里只做一次开关判断就放行，A 的请求路径与历史实现完全一致；
+    观察本身是旁路，任何异常都不允许影响播放。
+    """
+    if quality.dynamic_enabled() and request.url.path.startswith("/music/api/"):
+        try:
+            quality.observe_request(request.method, request.url.path,
+                                    request.query_params, request.headers)
+        except Exception as e:  # noqa: BLE001 - 观察失败绝不能影响请求
+            logger.debug("quality observe failed: %s", e)
+    return await call_next(request)
+
+
+@app.get("/_ext/quality")
+async def ext_quality_report():
+    """W3：动态音质决策 + 被动观察证据的诊断快照（只读，始终可用）。"""
+    try:
+        return {"ok": True, "data": quality.report(db_path=resolve_music_db())}
+    except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/prefetch")
+async def ext_prefetch_report():
+    """下一首预热的诊断快照（W4 移植 G v2.9.30）。只读，始终可用。"""
+    try:
+        return {"ok": True, "data": prefetch.status()}
+    except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.post("/_ext/cache/invalidate")
+async def ext_cache_invalidate():
+    """清空代理侧缓存（搜索 + 每日推荐 + 登录态 + 直链短缓存）。
+
+    代理与管理页面是两个独立进程：页面里扫码登录成功，只重置了页面进程自己的
+    登录态。代理这边仍会拿旧的 `_SEARCH_CACHE` 和旧的 `netease_auth` 登录态
+    （TTL 默认 300s）继续服务几分钟，表现为"明明登录了，搜索还是只有本地歌曲"。
+    所以登录成功后必须显式打这个端点（契约测试见
+    proxy/tests/test_admin_ui.py::test_proxy_exposes_the_endpoint_admin_ui_calls）。
+
+    只做丢弃内存/推荐缓存这一件事：不改配置、不影响播放、可重复调用。
+    """
+    dropped_search = len(_SEARCH_CACHE)
+    _reset_search_cache()          # A 的既有语义：连同在飞的搜索任务一起取消
+    daily_tasks = len(_DAILY_TASKS)
+    _cancel_daily_tasks()
+    # 已缓存的每日推荐歌单是按"未登录"或旧账号生成的，必须一并作废
+    purged_daily = 0
+    try:
+        root = dailyrec.recommend_cache_dir()
+        if os.path.isdir(root):
+            for user_dir in os.listdir(root):
+                sub = os.path.join(root, user_dir)
+                if os.path.isdir(sub):
+                    for name in os.listdir(sub):
+                        if name.endswith(".json"):
+                            try:
+                                os.remove(os.path.join(sub, name))
+                                purged_daily += 1
+                            except OSError:
+                                pass
+    except OSError as exc:
+        logger.warning("purge daily cache failed: %s", exc)
+
+    try:
+        netease_auth.invalidate_state()
+        login_state = True
+    except Exception as exc:  # noqa: BLE001 - 登录态辅助失败不能连累整个清缓存
+        logger.warning("netease_auth.invalidate_state failed: %s", exc)
+        login_state = False
+    # W6：频道歌单清单内存缓存 + 在飞的后台刷新任务一并作废
+    purged_channels = len(_channel_recs_cache)
+    _channel_recs_cache.clear()
+    for _task in list(_channel_recs_refresh.values()):
+        if not _task.done():
+            _task.cancel()
+    _channel_recs_refresh.clear()
+    purged_urls = invalidate_url_cache()
+    logger.info(
+        "cache invalidated: search=%d daily_tasks=%d daily_files=%d urls=%d channels=%d login_state=%s",
+        dropped_search, daily_tasks, purged_daily, purged_urls, purged_channels, login_state,
+    )
+    return {
+        "ok": True,
+        "cleared": {
+            "search_entries": dropped_search,
+            "daily_tasks": daily_tasks,
+            "daily_cache_files": purged_daily,
+            # A 没有在线元信息缓存（G 独有）。保留键位与 G 一致，让调用方拿到的
+            # 响应形状稳定；值恒为 0。
+            "online_info_entries": 0,
+            "play_urls": purged_urls,
+            "channel_lists": purged_channels,
+            "login_state": login_state,
+        },
+    }
+
+
+@app.get("/_ext/playlists/preview")
+async def ext_playlists_preview():
+    """歌单管理页预览（W6，移植 G v2.9.30）：当前口径会被注入的频道歌单 + 缓存状态。"""
+    client = get_musicbox_client(app)
+    logged_in = await _netease_logged_in()
+    items: list[dict] = []
+    if CONF.get("recommend_daily", True) and logged_in:
+        items.append({
+            "guid": playlists.DAILY_NS + "preview",
+            "name": f"每日推荐 {dailyrec.today_key()}",
+            "channel": "daily",
+            "track_count": 0,
+        })
+    channel_recs: list[dict] = []
+    try:
+        channel_recs, _keep, _complete = await _channel_playlist_records(client)
+    except Exception as exc:  # noqa: BLE001 - 预览接口不该 500
+        logger.warning("playlist preview: channel records failed: %s: %s", type(exc).__name__, exc)
+    for rec in channel_recs:
+        items.append({
+            "guid": rec.get("guid"),
+            "name": rec.get("name") or "网易云歌单",
+            "channel": rec.get("channel") or "",
+            "track_count": int(rec.get("track_count") or 0),
+        })
+    stamped_order = playlists.channel_order()
+    items.sort(
+        key=lambda it: stamped_order.index(it["channel"]) if it["channel"] in stamped_order else len(stamped_order)
+    )
+    items = playlists.apply_explicit_order(items)
+    current_items = [it for it in items if str(it.get("channel") or "") != "daily"]
+    cached_count = sum(
+        1 for it in current_items if playlists.load_cached_tracks(str(it.get("guid") or "")) is not None
+    )
+    return {
+        "ok": True,
+        "data": {
+            "items": [{**it, "is_daily": it["channel"] == "daily"} for it in items],
+            "logged_in": logged_in,
+            "manual_order": list(playlists.explicit_order_tokens()),
+            "cache": {
+                "cached": cached_count,
+                "total": len(current_items),
+                "ttl_s": playlists.tracks_cache_ttl(),
+                "refresh_at": playlists.refresh_time_of_day(),
+                "warming": _PLAYLIST_WARMING,
+            },
+        },
+    }
+
+
+@app.post("/_ext/playlists/warm")
+async def ext_playlists_warm():
+    """手动预热按钮（W6）：刷新当前口径下所有频道歌单的曲目缓存。"""
+    client = get_musicbox_client(app)
+    try:
+        recs, keep, complete = await _channel_playlist_records(client)
+    except Exception as exc:  # noqa: BLE001 - 清单拿不到就当空集
+        logger.warning("预热按钮：拉取当前歌单清单失败: %s: %s", type(exc).__name__, exc)
+        recs, keep, complete = [], set(), False
+    if complete and keep:
+        playlists.forget_stale(keep)
+    guids = [str(r.get("guid") or "") for r in recs if r.get("guid")]
+    if not _schedule_playlist_warm(app, force=True, guids=guids):
+        return {"ok": True, "data": {"started": False, "reason": "already_running"}}
+    return {"ok": True, "data": {"started": True, "total": len(guids)}}
 
 
 @app.get("/_ext/livez")
@@ -3698,7 +4259,14 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     try:
         if source in ("netease", "lx"):
             if source == "netease":
-                url = await resolve_netease_url(get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                # 带 stats ⇒ 播放链路启用直链短缓存：预热灌进来的链在这里零往返命中，
+                # 命中与否也会被记录（供统计区分 warm/cold）。
+                url = await resolve_netease_url(
+                    get_musicbox_client(request.app),
+                    song_id_from_online_guid(guid).split(":")[-1],
+                    request,
+                    stats={},
+                )
                 if not url:
                     return None
             else:
@@ -3716,14 +4284,13 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                 except Exception as exc:
                     logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
             ext = ext or (info or {}).get("ext")
-            # Read timeout must tolerate CDN throttling mid-file: a flat 10s
-            # timeout kills long pauses between chunks and surfaces as playback
-            # stuck at ~70-80% of the track.
-            owned = httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0),
-                follow_redirects=True,
-            )
-            client = owned
+            # 连接复用（移植 G v2.9.30）：一次播放客户端要发十几个 Range 请求，
+            # 每请求新建 client = 每个 Range 重做一次 TCP+TLS 握手。改成进程级共享
+            # 客户端 + 有界连接池后 owned 保持 None，响应迭代器结束时只关 resp；
+            # 未被读完的连接由 httpx 丢弃而不是放回池子，不会污染后续请求。
+            # Read timeout 仍须容忍 CDN 中途限速（read=60s，见 _new_cdn_client）：
+            # 扁平 10s 会在长暂停处杀掉流，表现为播到 70-80% 卡住。
+            client = get_cdn_client(request.app)
             req = client.build_request("GET", url, headers=headers)
         else:
             client = get_musicdl_client(request.app)
@@ -4693,6 +5260,185 @@ def ordered_stream_alternatives(item: dict) -> list[dict]:
     return sorted(alts, key=lambda x: rank.get(round(_candidate_kbps(x), 1), len(order)))
 
 
+# ---------------------------------------------------------------------------
+# W3：本地曲库优先（FNMUSIC_LOCAL_FIRST，默认关闭）
+#
+# 命中且档位兼容 → 直接出本地文件；网易云取链彻底失败时，本地命中作为兜底
+# 出流（沿用 G 的「不论档位兜底」语义）。索引来源就是 A 现有的
+# resolve_music_db() + detect_library_dir()，不涉及 trimgw 授权目录。
+# ---------------------------------------------------------------------------
+
+
+async def _local_first_match(request: Request, guid: str, item: "dict | None") -> "dict | None":
+    """按标题/歌手在本地曲库找同曲；标题优先用搜索缓存条目，缺失才查在线信息。"""
+    title = str((item or {}).get("title") or "")
+    artist = str((item or {}).get("artist") or "")
+    if not title:
+        try:
+            info = await asyncio.wait_for(
+                _online_info(request, guid, include_lyric=False), timeout=1.5)
+        except Exception as exc:  # noqa: BLE001 - 拿不到元信息就放弃本地优先
+            logger.debug("local-first info lookup failed for %s: %s", guid, type(exc).__name__)
+            info = None
+        if isinstance(info, dict):
+            title = str(info.get("title") or "")
+            artist = artist or str(info.get("artist") or "")
+    if not title.strip():
+        return None
+    return local_library.find_local_match(title, artist, resolve_music_db(), detect_library_dir())
+
+
+def _serve_local_entry(entry: dict, range_header: "str | None") -> Response:
+    return serve_file_with_range(entry["path"], range_header,
+                                 media_type_for_ext(entry.get("ext") or "mp3"))
+
+
+# ---------------------------------------------------------------------------
+# 下一首预热接线（移植 G v2.9.30 的 _prefetch_* 全家桶）
+# ---------------------------------------------------------------------------
+# 预热的目的是缩短「点击 → 出声」的等待：播放当前曲目时，把上下文里「下一首」
+# 的直链与元数据提前取回来（只填缓存，不下载音频字节）。
+_PREFETCH_TASKS: dict[str, asyncio.Task] = {}
+# 预热并发闸门。musicbox 是单进程，同时塞给它一堆请求只会让**所有**请求变慢，
+# 串起来反而更快；也在用户连续切歌时保护「正在播的那一首」。
+_PREFETCH_GATE: asyncio.Semaphore | None = None
+
+
+def _prefetch_gate() -> asyncio.Semaphore:
+    global _PREFETCH_GATE
+    if _PREFETCH_GATE is None:
+        _PREFETCH_GATE = asyncio.Semaphore(prefetch.max_concurrent())
+    return _PREFETCH_GATE
+
+
+def _online_url_cached(guid: str) -> bool:
+    """该在线曲目的直链是否已在短缓存里。
+
+    A 侧取流与解析都在 `_open_online_stream` 里完成，stream_track 拿不到那次解析
+    的 stats，所以用「解析前缓存里有没有这首歌」作为实测口径：有就是这次播放
+    极可能不付解析往返。只对网易云成立（三音源里只有它会走直链短缓存）。
+    """
+    if not is_online_guid(guid) or source_from_online_guid(guid) != "netease":
+        return False
+    return _url_cache_peek(song_id_from_online_guid(guid).split(":")[-1])
+
+
+async def _prefetch_one(request: Request, guid: str) -> None:
+    """后台把一首歌的直链与元数据取回来，只填缓存、不下载任何音频字节。
+
+    全程受并发闸门与超时双重约束：宁可这次不预热，也不能把 musicbox 拖慢
+    —— 那会让**正在播的那首**也跟着卡。
+    """
+    started = time.monotonic()
+    try:
+        async with _prefetch_gate():
+            try:
+                await asyncio.wait_for(_prefetch_inner(request, guid),
+                                       timeout=prefetch.timeout_seconds())
+            except asyncio.TimeoutError:
+                prefetch.bump("timeout")
+                prefetch.note_result(guid, False, (time.monotonic() - started) * 1000.0,
+                                     f"timeout>{prefetch.timeout_seconds():.0f}s")
+    except Exception as exc:  # noqa: BLE001 - 预热失败只记日志，绝不影响播放
+        prefetch.note_result(guid, False, (time.monotonic() - started) * 1000.0,
+                             f"{type(exc).__name__}: {exc}")
+    finally:
+        _PREFETCH_TASKS.pop(guid, None)
+
+
+async def _prefetch_inner(request: Request, guid: str) -> None:
+    song_id = song_id_from_online_guid(guid).split(":")[-1]
+    if not song_id:
+        prefetch.note_result(guid, False, 0.0, "no song id")
+        return
+    started = time.monotonic()
+    client = get_musicbox_client(request.app)
+    # 带 stats 调用 ⇒ 解析结果会灌进直链短缓存，下一首播放时即可零往返命中。
+    flags: dict = {}
+    url, _info = await asyncio.gather(
+        resolve_netease_url(client, song_id, request, stats=flags),
+        _online_info(request, guid),
+        return_exceptions=True,
+    )
+    ok = bool(url) and not isinstance(url, Exception)
+    prefetch.note_result(guid, ok, (time.monotonic() - started) * 1000.0,
+                         "" if ok else f"url={url!r}")
+
+
+def _schedule_prefetch(request: Request, guid: str) -> None:
+    """为「下 N 首」安排预热。同步返回，失败静默，绝不阻塞当前播放。"""
+    try:
+        if not prefetch.enabled():
+            return
+        targets = prefetch.next_n(guid, prefetch._lookahead())
+        if not targets:
+            prefetch.bump("no_next")
+            return
+        _sched = 0
+        for next_guid in targets:
+            _sched += _prefetch_if_needed(request, guid, next_guid)
+        if _sched:
+            logger.info("prefetch schedule: %s -> %s", guid, ", ".join(targets))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("prefetch schedule failed for %s: %s: %s", guid, type(exc).__name__, exc)
+
+
+def _prefetch_if_needed(request: Request, from_guid: str, next_guid: str) -> int:
+    """给单首歌安排预热，返回 1 表示真的排了、0 表示跳过（已在预热/非在线）。"""
+    if not is_online_guid(next_guid) or next_guid == from_guid:
+        prefetch.bump("no_next")
+        return 0
+    # A 的三音源：只有网易云有直链短缓存可灌，lx/musicdl 的解析路径不同，不预热。
+    if source_from_online_guid(next_guid) != "netease":
+        prefetch.bump("no_next")
+        return 0
+    if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
+        prefetch.bump("already")
+        return 0
+    # 总闸门：musicbox 是单进程，用户连续切歌时**每一首**都会追加 N 个预热，队列
+    # 越堆越长它越消化不过来，最后被拖慢的恰恰是「正在播的那一首」。到上限就放弃
+    # 这次预热——预热是锦上添花，跟播放冲突时必须让位。
+    if len(_PREFETCH_TASKS) >= prefetch.max_queue():
+        prefetch.bump("queued_out")
+        return 0
+    prefetch.bump("scheduled")
+    _PREFETCH_TASKS[next_guid] = asyncio.create_task(_prefetch_one(request, next_guid))
+    return 1
+
+
+def _schedule_list_prefetch(request: Request, context_guid: str) -> None:
+    """歌单列表一下发就预热它的头几首——用户点开时第一首的直链已经热了。
+
+    只预热头 1 首：真机 musicbox 会同时收到十几个歌单的列表请求，一首歌单预热
+    多了反而把它自己堵住。
+    """
+    try:
+        if not prefetch.enabled() or not prefetch.on_list_enabled():
+            return
+        for g in prefetch.first_of(context_guid, 1):
+            _prefetch_if_needed(request, "", g)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("list prefetch failed for %s: %s: %s",
+                     context_guid, type(exc).__name__, exc)
+
+
+def _remember_prefetch_context(request: Request, context_guid: str, tracks: list) -> None:
+    """记下刚下发的一份有序曲目列表——stream 请求里没有歌单信息，「下一首是谁」
+    全靠它推断（移植 G v2.9.30 的 playlist_track_list 接线点）。
+
+    记不住只是不能预热，绝不影响打开歌单。
+    """
+    try:
+        n = prefetch.remember_context(context_guid, tracks)
+        if n:
+            logger.info("prefetch context: %s（%d 首）", context_guid, n)
+            # 列表刚下发就预热头一首：用户点开时它的直链已经是热的
+            _schedule_list_prefetch(request, context_guid)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("prefetch context failed for %s: %s: %s",
+                     context_guid, type(exc).__name__, exc)
+
+
 @app.api_route("/music/api/v1/track/stream", methods=["GET", "HEAD"])
 @app.api_route("/music/api/v1/track/stream/{subpath:path}", methods=["GET", "HEAD"])
 async def stream_track(request: Request, subpath: str = ""):
@@ -4708,6 +5454,32 @@ async def stream_track(request: Request, subpath: str = ""):
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         return serve_file_with_range(cached, range_header, media_type_for_ext(ext))
     item, entry = _retained_track(request, guid)
+    # 播放当前曲目 → 把上下文里「下一首」的直链/元信息提前取回来（只填缓存）。
+    # 放在 cached/HEAD 早返回之后：命中本地缓存或 HEAD 探测时不必再预热。
+    _schedule_prefetch(request, guid)
+    warming_now = guid in _PREFETCH_TASKS
+    warm_before = _online_url_cached(guid)
+    _play_started = time.monotonic()
+    # W3：本地曲库优先（默认关闭）。关闭时 local_hit 恒为 None，下面两条分支都不
+    # 会执行，也不会提前计算 quality.resolve —— 与历史代码路径完全一致。
+    local_hit = None
+    if local_library.local_first_enabled() and source_from_online_guid(guid) == "netease":
+        try:
+            local_hit = await _local_first_match(request, guid, item)
+        except Exception as exc:  # noqa: BLE001 - 本地优先失败就退回在线链路
+            logger.warning("local-first lookup failed for %s: %s", guid, type(exc).__name__)
+            local_hit = None
+        if local_hit:
+            decision = quality.resolve(request, db_path=resolve_music_db())
+            if local_library.serves_request(local_hit, decision.get("level") or "",
+                                            decision.get("network") or ""):
+                logger.info("local-first hit: %s -> %s (level=%s network=%s policy=%s)",
+                            guid, local_hit.get("path"), decision.get("level"),
+                            decision.get("network"), decision.get("policy"))
+                return _serve_local_entry(local_hit, range_header)
+            logger.debug("local-first skip: %s 本地 %s 与档位 %s 不兼容（network=%s）",
+                         guid, local_hit.get("path"), decision.get("level"),
+                         decision.get("network"))
     candidates = [guid]
     # Byte offsets are encoding-specific: do not cross sources on seek/probe.
     if should_cache(range_header) and item and request.query_params.get("_ext_rendition") != "1":
@@ -4744,6 +5516,10 @@ async def stream_track(request: Request, subpath: str = ""):
                     target = request.url.include_query_params(guid=candidate, _ext_rendition="1")
                     location = target.path + (f"?{target.query}" if target.query else "")
                     return RedirectResponse(location, status_code=307, headers={"Cache-Control": "no-store"})
+                # play-start 计数：warm 用「解析前直链已在短缓存」实测，warming 表示
+                # 这次播放撞上了正在跑的同曲预热（归 cold，但成因单列，不混进命中率）。
+                prefetch.note_play(guid, (time.monotonic() - _play_started) * 1000.0,
+                                   warm_before, warming=warming_now)
                 # Cache the selected source's bytes under its own GUID, never
                 # splice a failed stream or alias different encodings for seeks.
                 if not should_cache(range_header):
@@ -4759,6 +5535,13 @@ async def stream_track(request: Request, subpath: str = ""):
                 break
             if not await _recover_source(request, candidate, entry):
                 break
+    if local_hit:
+        # 网易云取链彻底失败时本地命中不论档位兜底出流（沿用 G 的语义）。
+        try:
+            logger.info("local-first fallback: %s -> %s", guid, local_hit.get("path"))
+            return _serve_local_entry(local_hit, range_header)
+        except Exception as exc:  # noqa: BLE001 - 兜底失败仍如实 404
+            logger.warning("local-first fallback failed for %s: %s", guid, type(exc).__name__)
     return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
 
 
@@ -4773,7 +5556,8 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
     try:
         if source == "netease":
             url = await resolve_netease_url(
-                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1])
+                get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
+                request)
             return (url or None, None)
         if source == "lx":
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
@@ -6491,6 +7275,292 @@ async def playlist_delete(request: Request):
     return JSONResponse(content=envelope, headers=headers)
 
 
+# ---------------------------------------------------------------------------
+# W6（移植 G v2.9.30）：网易云「频道歌单」——榜/分类/我的/新碟/电台
+# 清单走 SWR 内存缓存（stale-while-revalidate），曲目走磁盘缓存 + 后台刷新，
+# 全部由 playlists.py 提供持久化与解析，app.py 只做接线与分发。
+# ---------------------------------------------------------------------------
+_CHANNEL_LIST_CACHE_TTL = _env_float("FNMUSIC_CHANNEL_LIST_CACHE_TTL", 300.0)
+_channel_recs_cache: dict[tuple, dict] = {}
+_channel_recs_refresh: dict[tuple, "asyncio.Task"] = {}
+
+
+async def _netease_logged_in() -> bool:
+    """网易登录态探测：失败按未登录处理（不抛出，避免拖垮歌单列表）。"""
+    try:
+        state = await netease_auth.fetch_state(get_musicbox_client(app))
+        return bool(state.logged_in)
+    except Exception as exc:  # noqa: BLE001 - 探测失败只降级为未登录
+        logger.warning("login state probe failed: %s: %s", type(exc).__name__, exc)
+        return False
+
+
+def _channel_recs_cache_key() -> tuple:
+    return (playlists.channels_enabled(), playlists.category_name(), playlists.channel_limit())
+
+
+async def _collect_channel_records(client: httpx.AsyncClient, key: tuple):
+    logged_in = await _netease_logged_in()
+    recs, keep, complete = await playlists.collect_records(client, logged_in)
+    # 记录采集时的事件循环：条目只对同一循环有效。生产只有一个常驻循环（等价于
+    # G 的纯 TTL 缓存），而测试/进程重启会新建循环——不隔离就会把上一个循环里
+    # 旧客户端采集的清单当成命中，跨用例串数据。
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    _channel_recs_cache[key] = {
+        "ts": time.time(), "records": recs, "keep": keep, "complete": complete, "loop": loop,
+    }
+    return recs, keep, complete
+
+
+def _schedule_channel_recs_refresh(client: httpx.AsyncClient, key: tuple) -> None:
+    existing = _channel_recs_refresh.get(key)
+    if existing is not None and not existing.done():
+        return
+
+    async def _job() -> None:
+        try:
+            await _collect_channel_records(client, key)
+        except Exception as exc:  # noqa: BLE001 - 后台刷新失败只记日志
+            logger.warning("口径清单后台刷新失败: %s: %s", type(exc).__name__, exc)
+        finally:
+            _channel_recs_refresh.pop(key, None)
+
+    _channel_recs_refresh[key] = asyncio.create_task(_job())
+
+
+async def _channel_playlist_records(client: httpx.AsyncClient):
+    """返回 (records, keep, complete)；命中缓存立即返回，过期先返回旧值再后台刷新。"""
+    if _CHANNEL_LIST_CACHE_TTL <= 0:
+        logged_in = await _netease_logged_in()
+        return await playlists.collect_records(client, logged_in)
+    key = _channel_recs_cache_key()
+    try:
+        loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    hit = _channel_recs_cache.get(key)
+    if hit is not None and hit.get("loop") is not loop:
+        # 条目属于别的事件循环（测试用例/重启后的新循环）：当作未命中重新采集
+        hit = None
+    if hit is not None:
+        if (time.time() - float(hit.get("ts") or 0.0)) < _CHANNEL_LIST_CACHE_TTL:
+            return hit["records"], hit["keep"], hit["complete"]
+        _schedule_channel_recs_refresh(client, key)
+        return hit["records"], hit["keep"], hit["complete"]
+    return await _collect_channel_records(client, key)
+
+
+def _channel_public_fields(rec: dict) -> dict:
+    now = int(time.time())
+    return {
+        "guid": rec.get("guid"),
+        "name": rec.get("name") or "网易云歌单",
+        "coverId": rec.get("guid"),
+        "cover_url": rec.get("cover_url") or "",
+        "coverUrl": rec.get("cover_url") or "",
+        "createdAt": int(rec.get("createdAt") or now),
+        "updatedAt": int(rec.get("updatedAt") or now),
+        "trackCount": int(rec.get("track_count") or 0),
+        "isDaily": False,
+        "source": "netease",
+        "channel": rec.get("channel") or "",
+    }
+
+
+async def _enrich_netease_items(client: httpx.AsyncClient, items: list[dict]) -> None:
+    """批量补全歌曲详情（封面等）。失败只记日志，不影响已映射的曲目。"""
+    ids = [str(it["id"]).split(":", 1)[-1] for it in items if it.get("id")]
+    if not ids:
+        return
+    try:
+        resp = await client.get("/api/v1/songs/detail", params={"ids": ",".join(ids[:100])}, timeout=15.0)
+    except Exception as exc:  # noqa: BLE001 - 详情补全失败不阻断
+        logger.warning("Failed to fetch songs detail: %s: %s", type(exc).__name__, exc)
+        return
+    if resp.status_code != 200:
+        return
+    try:
+        payload = resp.json()
+    except Exception:  # noqa: BLE001
+        return
+    if not isinstance(payload, dict) or payload.get("ok") is False:
+        return
+    detail_list = payload.get("data")
+    if not isinstance(detail_list, list):
+        return
+    detail_map: dict[str, dict] = {}
+    for detail in detail_list:
+        if isinstance(detail, dict):
+            key = str(detail.get("song_id") or detail.get("id") or "")
+            if key:
+                detail_map[key] = detail
+    for item in items:
+        detail = detail_map.get(str(item.get("id") or "").split(":", 1)[-1])
+        if detail:
+            netease_items.apply_song_detail(item, detail)
+
+
+async def _fetch_channel_tracks(client: httpx.AsyncClient, guid: str) -> list[dict]:
+    return await playlists.resolve_track_items(client, guid, netease_items.map_netease_song, _enrich_netease_items)
+
+
+_TRACK_REFRESH_TASKS: dict[str, "asyncio.Task"] = {}
+
+
+def _schedule_track_refresh(fastapi_app: FastAPI, guid: str) -> None:
+    """单飞去重：同一歌单只允许一个后台刷新任务在飞。"""
+    existing = _TRACK_REFRESH_TASKS.get(guid)
+    if existing is not None and not existing.done():
+        return
+
+    async def _job() -> None:
+        try:
+            items = await _fetch_channel_tracks(get_musicbox_client(fastapi_app), guid)
+            if items:
+                playlists.store_cached_tracks(guid, items)
+                logger.info("歌单缓存已后台刷新：%s（%d 首）", guid, len(items))
+        except Exception as exc:  # noqa: BLE001 - 后台刷新失败保留旧缓存
+            logger.warning("歌单缓存后台刷新失败 %s: %s: %s", guid, type(exc).__name__, exc)
+        finally:
+            _TRACK_REFRESH_TASKS.pop(guid, None)
+
+    _TRACK_REFRESH_TASKS[guid] = asyncio.create_task(_job())
+
+
+async def _channel_tracks_items(fastapi_app: FastAPI, guid: str) -> list[dict]:
+    hit = playlists.load_cached_tracks(guid)
+    if hit is not None:
+        ts, items = hit
+        if (time.time() - float(ts or 0.0)) > playlists.tracks_cache_ttl():
+            _schedule_track_refresh(fastapi_app, guid)
+        return items
+    items = await _fetch_channel_tracks(get_musicbox_client(fastapi_app), guid)
+    playlists.store_cached_tracks(guid, items)
+    return items
+
+
+async def _channel_tracks(request: Request, guid: str, limit: int = 0) -> list[dict]:
+    items = await _channel_tracks_items(request.app, guid)
+    if limit and limit > 0:
+        items = items[:limit]
+    return [build_online_track(it) for it in items]
+
+
+async def _channel_playlist_cover(request: Request, guid: str) -> str:
+    """频道歌单封面：注册表优先，缺失时取首曲封面并回写注册表。"""
+    rec = playlists.lookup(guid)
+    cover = str(rec.get("cover_url") or "")
+    if cover:
+        return cover
+    try:
+        tracks = await _channel_tracks(request, guid, limit=1)
+    except Exception:  # noqa: BLE001 - 取封面失败不能 500
+        tracks = []
+    first = str((tracks[0] or {}).get("coverUrl") or "") if tracks else ""
+    if first:
+        playlists.remember({**rec, "guid": guid, "cover_url": first})
+        playlists.save_registry()
+    return first
+
+
+_PLAYLIST_WARMING = False
+_LAST_AUTO_WARM_AT = 0.0
+
+
+def _playlist_warm_cooldown() -> float:
+    return float(playlists.tracks_cache_ttl())
+
+
+def _warm_skip_fresh_s() -> float:
+    return max(0.0, _env_float("FNMUSIC_WARM_SKIP_FRESH_S", 3600.0))
+
+
+async def _warm_playlist_caches(
+    fastapi_app: FastAPI, guids: list[str] | None = None, skip_fresh_s: float = 0.0
+) -> dict:
+    """预热频道歌单曲目缓存；单飞（_PLAYLIST_WARMING）避免按钮连点打爆上游。"""
+    global _PLAYLIST_WARMING
+    if _PLAYLIST_WARMING:
+        return {"started": False, "reason": "already_running"}
+    _PLAYLIST_WARMING = True
+    refreshed = 0
+    skipped_fresh = 0
+    try:
+        client = get_musicbox_client(fastapi_app)
+        target = list(guids) if guids is not None else []
+        if guids is None:
+            try:
+                recs, keep, complete = await _collect_channel_records(client, _channel_recs_cache_key())
+                if complete and keep:
+                    playlists.forget_stale(keep)
+                target = [str(r.get("guid") or "") for r in recs if r.get("guid")]
+            except Exception as exc:  # noqa: BLE001 - 清单拿不到就不预热
+                logger.warning("歌单缓存预热：拉取清单失败 %s: %s", type(exc).__name__, exc)
+                target = []
+        for guid in target:
+            if not guid:
+                continue
+            if skip_fresh_s > 0:
+                hit = playlists.load_cached_tracks(guid)
+                if hit is not None and (time.time() - float(hit[0] or 0.0)) < skip_fresh_s:
+                    skipped_fresh += 1
+                    continue
+            try:
+                items = await _fetch_channel_tracks(client, guid)
+            except Exception as exc:  # noqa: BLE001 - 单个歌单失败继续下一个
+                logger.warning("歌单缓存预热失败 %s: %s: %s", guid, type(exc).__name__, exc)
+                continue
+            if items:
+                playlists.store_cached_tracks(guid, items)
+                refreshed += 1
+            await asyncio.sleep(1.0)
+        logger.info("歌单缓存预热完成：刷新 %d、跳过（仍新鲜）%d、共 %d 个", refreshed, skipped_fresh, len(target))
+        return {"started": True, "refreshed": refreshed, "skipped_fresh": skipped_fresh, "total": len(target)}
+    finally:
+        _PLAYLIST_WARMING = False
+
+
+def _schedule_playlist_warm(
+    fastapi_app: FastAPI, *, force: bool = False, guids: list[str] | None = None, skip_fresh_s: float = 0.0
+) -> bool:
+    global _LAST_AUTO_WARM_AT
+    if _PLAYLIST_WARMING:
+        return False
+    if not force:
+        if (time.time() - _LAST_AUTO_WARM_AT) < _playlist_warm_cooldown():
+            return False
+        _LAST_AUTO_WARM_AT = time.time()
+    try:
+        asyncio.create_task(_warm_playlist_caches(fastapi_app, guids=guids, skip_fresh_s=skip_fresh_s))
+    except RuntimeError:  # 没有运行中的事件循环（同步上下文）时静默跳过
+        return False
+    return True
+
+
+async def _playlist_refresh_loop(fastapi_app: FastAPI, stop_event: asyncio.Event) -> None:
+    """每日定时（FNMUSIC_PLAYLIST_REFRESH_AT，默认 04:30）刷新频道歌单缓存。"""
+    while not stop_event.is_set():
+        delay = playlists.seconds_until_daily_refresh()
+        if delay is None:
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=3600.0)
+            except asyncio.TimeoutError:
+                continue
+            return
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            return
+        logger.info("定时刷新歌单缓存开始（%s）", playlists.refresh_time_of_day())
+        _schedule_playlist_warm(fastapi_app, force=True, skip_fresh_s=_warm_skip_fresh_s())
+        await asyncio.sleep(5.0)
+
+
 def _playlist_public_fields(record: dict, tracks: list | None = None) -> dict:
     # 封面取曲在下发时重算（兼容当天旧缓存），并伪装成官方 track_+32hex 形态：
     # 官方 App 按 id 格式过滤，online: 原样下发的 coverId 不会被渲染成图标。
@@ -6532,8 +7602,19 @@ async def playlist_list(request: Request):
     kinds = _recommend_injectable_kinds(user_guid)
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
-    if not kinds and not nm_on:
-        # 两个推荐开关全关（或 shared 会话无任何可注入类型）且账号歌单关闭：不注入
+    # W6 频道歌单（榜/分类/我的/新碟/电台）：SWR 内存缓存，上游不可用时返回空表
+    channel_recs: list[dict] = []
+    keep: set[str] = set()
+    complete = False
+    try:
+        channel_recs, keep, complete = await _channel_playlist_records(get_musicbox_client(request.app))
+        if complete:
+            playlists.forget_stale(keep)
+    except Exception as e:  # noqa: BLE001 - 频道清单失败不能拖垮官方歌单列表
+        logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
+        channel_recs = []
+    if not kinds and not nm_on and not channel_recs:
+        # 两个推荐开关全关（或 shared 会话无任何可注入类型）、账号歌单与频道清单都为空：不注入
         return JSONResponse(content=envelope, headers=headers)
 
     data = envelope.get("data")
@@ -6544,7 +7625,10 @@ async def playlist_list(request: Request):
     if not isinstance(official, list):
         official = []
         data["list"] = official
-    recs: list[dict] = []
+    # W6：推荐歌单 + 频道歌单统一按 channel_order 排序、按显式顺序重排、
+    # 最后写入展示用递增时间戳（客户端按 updatedAt 排序渲染）。
+    stamped_order = playlists.channel_order()
+    head_items: list[tuple[str, dict]] = []
     for kind in kinds:
         try:
             bundle = await _peek_daily_bundle(request, user_guid, kind)
@@ -6557,7 +7641,15 @@ async def playlist_list(request: Request):
             continue
         rec = _playlist_public_fields(bundle.get("playlist") or {}, tracks)
         rec["trackCount"] = len(tracks)
-        recs.append(rec)
+        head_items.append((kind, rec))
+    for ch_rec in channel_recs:
+        ch = str(ch_rec.get("channel") or "")
+        head_items.append((ch if ch in stamped_order else "category", _channel_public_fields(ch_rec)))
+    head_items.sort(
+        key=lambda pair: stamped_order.index(pair[0]) if pair[0] in stamped_order else len(stamped_order)
+    )
+    head = playlists.apply_explicit_order([it for _tok, it in head_items])
+    head = playlists.stamp_display_order(head)
     nm_cards: list[dict] = []
     if nm_on:
         try:
@@ -6574,11 +7666,21 @@ async def playlist_list(request: Request):
             nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
     official = [
         it for it in official
-        if not (isinstance(it, dict) and dailyrec.is_recommend_playlist_guid(str(it.get("guid") or "")))
+        if not (isinstance(it, dict) and (
+            dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))
+            or playlists.is_channel_guid(str(it.get("guid") or ""))
+        ))
     ]
-    data["list"] = recs + nm_cards + official
+    data["list"] = head + nm_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(recs) + len(nm_cards)
+    data["total"] = (total if isinstance(total, int) else len(official)) + len(head) + len(nm_cards)
+    if head:
+        # 频道清单在列表页顺带预热（冷却期由 _schedule_playlist_warm 控制）
+        _schedule_playlist_warm(
+            request.app,
+            skip_fresh_s=_warm_skip_fresh_s(),
+            guids=[str(r.get("guid") or "") for r in channel_recs if r.get("guid")],
+        )
     return JSONResponse(content=envelope, headers=headers)
 
 
@@ -6596,6 +7698,20 @@ async def playlist_detail(request: Request):
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+    if playlists.is_channel_guid(guid):
+        # W6 频道歌单：从注册表取卡片（createdAt/updatedAt 用注册表 ts，
+        # 与列表页 stamp_display_order 写入的值一致，客户端按它排序）
+        reg = playlists.lookup(guid)
+        rec = {
+            "guid": guid,
+            "name": reg.get("name") or f"网易云歌单 {playlists._target_id(guid) or ''}".strip(),
+            "cover_url": reg.get("cover_url") or "",
+            "track_count": reg.get("track_count") or 0,
+            "channel": reg.get("channel") or playlists.channel_of(guid),
+            "createdAt": reg.get("ts") or int(time.time()),
+            "updatedAt": reg.get("ts") or int(time.time()),
+        }
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": _channel_public_fields(rec)})
     kind = dailyrec.online_playlist_kind(guid)
     if not kind:
         # 官方歌单：本地存在在线附加条目才拦截修正 trackCount，否则纯透传
@@ -6627,6 +7743,12 @@ async def playlist_detail(request: Request):
     bundle = await _load_daily_bundle(request, user_guid, kind)
     rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
     rec["trackCount"] = len(bundle.get("tracks") or [])
+    # W6：列表页用 stamp_display_order 写的注册表 ts 必须覆盖详情页，
+    # 否则客户端排序与列表页不一致（G v2.9.30 同款处理）
+    reg_ts = playlists.lookup(guid).get("ts")
+    if reg_ts:
+        rec["createdAt"] = int(reg_ts)
+        rec["updatedAt"] = int(reg_ts)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": rec})
 
 
@@ -6635,13 +7757,14 @@ async def playlist_batch_detail(request: Request):
     raw = request.query_params.get("guids") or request.query_params.get("guid") or ""
     guids = [g.strip() for g in raw.split(",") if g.strip()]
     recommend_ids = [g for g in guids if dailyrec.is_recommend_playlist_guid(g)]
+    channel_ids = [g for g in guids if playlists.is_channel_guid(g)]
     nm_ids = [
         pid for pid in (
             nmpl.nm_playlist_id_from_guid(g) or nmpl.nm_playlist_id_from_guid(resolve_real_guid(g))
             for g in guids
         ) if pid
     ]
-    if not recommend_ids and not nm_ids and not plt_dir_has_data():
+    if not recommend_ids and not nm_ids and not channel_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -6649,6 +7772,7 @@ async def playlist_batch_detail(request: Request):
         g for g in guids
         if not dailyrec.is_recommend_playlist_guid(g)
         and not nmpl.is_nm_playlist_guid(resolve_real_guid(g))
+        and not playlists.is_channel_guid(g)
     ]
     official_list: list = []
     if rest:
@@ -6689,7 +7813,23 @@ async def playlist_batch_detail(request: Request):
         bundle = await _load_daily_bundle(request, user_guid, kind)
         rec = _playlist_public_fields(bundle.get("playlist") or {}, bundle.get("tracks") or [])
         rec["trackCount"] = len(bundle.get("tracks") or [])
+        reg_ts = playlists.lookup(g).get("ts")
+        if reg_ts:
+            rec["createdAt"] = int(reg_ts)
+            rec["updatedAt"] = int(reg_ts)
         recs.append(rec)
+    for g in channel_ids:
+        # W6 频道歌单：注册表卡片（ts 与列表页一致）
+        reg = playlists.lookup(g)
+        recs.append(_channel_public_fields({
+            "guid": g,
+            "name": reg.get("name") or f"网易云歌单 {playlists._target_id(g) or ''}".strip(),
+            "cover_url": reg.get("cover_url") or "",
+            "track_count": reg.get("track_count") or 0,
+            "channel": reg.get("channel") or playlists.channel_of(g),
+            "createdAt": reg.get("ts"),
+            "updatedAt": reg.get("ts"),
+        }))
     for pid in nm_ids:
         card = nmpl.card_for(pid)
         if card is not None:
@@ -6719,6 +7859,50 @@ async def playlist_track_list(request: Request):
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
         )
+        _remember_prefetch_context(request, guid, tracks)
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = tracks[start:start + size]
+        return JSONResponse(
+            content=disguise_client_json({
+                "code": 0,
+                "msg": "ok",
+                "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+            })
+        )
+    if playlists.is_channel_guid(guid):
+        # W6 频道歌单曲目：磁盘缓存优先（过期则后台刷新），缺失时同步拉取
+        upstream_client = get_upstream_client(request.app)
+        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        started = time.monotonic()
+        cache_state = "hit"
+        try:
+            if playlists.load_cached_tracks(guid) is None:
+                cache_state = "miss"
+            tracks = dailyrec.stamp_playlist_tracks(await _channel_tracks(request, guid))
+        except Exception as e:  # noqa: BLE001 - 上游失败回 502，客户端可重试
+            logger.warning("channel playlist tracks failed for %s: %s: %s", guid, type(e).__name__, e)
+            return JSONResponse(
+                content={"code": 502, "msg": "netease playlist unavailable", "data": None},
+                status_code=502,
+            )
+        _remember_prefetch_context(request, guid, tracks)
+        _slow_ms = (time.monotonic() - started) * 1000.0
+        if _slow_ms > 1000:
+            logger.info("playlist tracks slow open: %.0fms cache=%s %s", _slow_ms, cache_state, guid)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
         except (TypeError, ValueError):
@@ -6807,6 +7991,9 @@ async def playlist_track_list(request: Request):
 
         data["list"] = official_list + online_page
         data["total"] = official_total + len(online_objs)
+        # 官方歌单没有 G 侧对应分支，但客户端同样按「官方条目 + 在线附加」的
+        # 顺序播放，这里按同一顺序登记上下文（官方 guid 不在线会被预热环节跳过）。
+        _remember_prefetch_context(request, guid, official_list + online_objs)
         return JSONResponse(content=disguise_client_json(envelope), headers=headers)
 
 
@@ -6816,6 +8003,7 @@ async def playlist_track_list(request: Request):
         return auth_resp
     bundle = await _load_daily_bundle(request, user_guid, kind)
     tracks = dailyrec.stamp_playlist_tracks(list(bundle.get("tracks") or []))
+    _remember_prefetch_context(request, guid, tracks)
     try:
         page = max(int(request.query_params.get("page") or 1), 1)
     except (TypeError, ValueError):
