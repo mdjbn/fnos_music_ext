@@ -126,6 +126,13 @@ def _as_time_of_day(v: Any) -> str:
         raise ValueError(f"时间超出范围（00:00–23:59），收到 {s!r}")
     return f"{h:02d}:{mi:02d}"
 
+# 歌单口径/大类顺序的合法 key。**单一定义在这里**：admin_ui 与音源页共用同一套校验，
+# 早先常量只写在 admin_ui 里，coercer 搬过来后引用不到，改「歌单大类顺序」就 NameError ⇒ HTTP 500。
+CHANNEL_KEYS = ("mine", "nrec", "toplist", "category", "newalbum", "fm")
+# 大类顺序额外允许 daily / localdaily（它们不在勾选框里，由各自独立开关控制）
+_ORDER_KEYS = ("daily", "localdaily") + CHANNEL_KEYS
+
+
 def _as_channels(v: Any) -> str:
     """口径勾选列表：逗号分隔，只接受已知 key，按固定顺序输出。"""
     picked: list[str] = []

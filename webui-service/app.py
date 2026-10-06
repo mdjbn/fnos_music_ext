@@ -481,6 +481,8 @@ async def api_extended_put(body: ExtendedBody):
             updates[meta["env"]] = ext_coerce(field, text)
         except ValueError as exc:
             errors.append(f"{meta.get('label') or field}：{exc}")
+        except Exception as exc:  # noqa: BLE001 - coercer 自己出 bug 也要给出可读错误，不能是裸 500
+            errors.append(f"{meta.get('label') or field}：校验器异常（{type(exc).__name__}: {exc}）")
     if errors:
         return JSONResponse(content={"ok": False, "error": "；".join(errors[:6])}, status_code=400)
     changed = write_env(updates) if updates else []

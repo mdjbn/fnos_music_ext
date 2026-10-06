@@ -832,3 +832,30 @@ def test_log_page_renamed_and_switches_aligned(env_file):
     js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
     assert 'sw.className = "switch-row"' in js, "布尔项必须用 switch-row 排版才会与旧页开关对齐"
     assert "extGroupOrder" in js, "组顺序要按后端 groups 排（洛雪同步须排在歌单与频道之前）"
+
+
+def test_put_extended_handles_ported_channel_fields(env_file):
+    """回归：改「歌单大类顺序 / 歌单口径」曾因 coercer 引用不到的常量而 HTTP 500。"""
+    with authed_client() as client:
+        r = client.put("/api/extended", json={"values": {
+            "netease_channels": "mine,toplist",
+            "netease_channel_order": "daily,mine,toplist",
+        }})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert "FNMUSIC_NETEASE_CHANNEL_ORDER" in data["changed"]
+        assert data["values"]["netease_channel_order"] == "daily,mine,toplist"
+        assert data["values"]["netease_channels"] == "mine,toplist"
+
+
+def test_put_extended_turns_coercer_bug_into_readable_400(env_file, monkeypatch):
+    """校验器自己抛非 ValueError 时也要给出可读的 400，而不是裸 500。"""
+    def boom(_field, _raw):
+        raise RuntimeError("炸了")
+
+    monkeypatch.setattr(webui, "ext_coerce", boom)
+    with authed_client() as client:
+        r = client.put("/api/extended", json={"values": {"netease_channel_order": "daily"}})
+        assert r.status_code == 400
+        assert "校验器异常" in r.json()["error"]
+

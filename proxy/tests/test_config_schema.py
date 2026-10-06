@@ -134,3 +134,32 @@ def test_requested_placements():
     assert page_of["login_check_interval_h"] == "notify"
     assert cs.PAGES["extended"] == "日志"
     assert [f for f in cs.fields_of_page("extended")] == ["log_max_mb", "log_max_days", "log_quiet"]
+
+
+def test_every_field_default_coerces_without_bug():
+    """回归：coercer 从 admin_ui 搬到 config_schema 时漏了模块级常量（CHANNEL_KEYS/_ORDER_KEYS），
+    于是改「歌单大类顺序」「歌单口径」时 NameError → /api/extended 直接 HTTP 500。
+    这里把每个字段的默认值都过一遍校验器：ValueError=默认值本身不合法（要修默认值），
+    其它异常=代码缺陷（就是这次的问题）。
+    """
+    broken = []
+    for field, meta in cs.FIELDS.items():
+        try:
+            cs.coerce(field, meta.get("default", ""))
+        except ValueError as exc:
+            broken.append((field, f"默认值不合法: {exc}"))
+        except Exception as exc:  # noqa: BLE001
+            broken.append((field, f"{type(exc).__name__}: {exc}"))
+    assert not broken, broken
+
+
+def test_channel_keys_are_single_source_of_truth():
+    """常量只在 config_schema 定义，控制台引用同一份，避免两处漂移。"""
+    from proxy import admin_ui
+
+    assert cs.CHANNEL_KEYS == ("mine", "nrec", "toplist", "category", "newalbum", "fm")
+    assert cs._ORDER_KEYS == ("daily", "localdaily") + cs.CHANNEL_KEYS
+    assert admin_ui.CHANNEL_KEYS is cs.CHANNEL_KEYS or admin_ui.CHANNEL_KEYS == cs.CHANNEL_KEYS
+    assert admin_ui._ORDER_KEYS == cs._ORDER_KEYS
+    assert cs.coerce("netease_channel_order", "mine,daily") == "mine,daily"   # 顺序原样保留
+

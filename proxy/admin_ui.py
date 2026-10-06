@@ -122,11 +122,11 @@ TEMPLATES = ("markdown", "html", "txt", "json")
 
 # 可在网页上勾选的歌单口径。「每日推荐」不在此列——它有独立开关 daily_enabled，
 # 重复放一个勾只会让人以为两个开关各管一半。
-CHANNEL_KEYS = ("mine", "nrec", "toplist", "category", "newalbum", "fm")
+CHANNEL_KEYS = config_schema.CHANNEL_KEYS      # 常量落在 config_schema（校验表也在那，避免两处漂移）
 
 
 # 大类顺序里额外允许 daily / localdaily（它们不在勾选框里，由各自独立开关控制）
-_ORDER_KEYS = ("daily", "localdaily") + CHANNEL_KEYS
+_ORDER_KEYS = config_schema._ORDER_KEYS
 
 
 CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
