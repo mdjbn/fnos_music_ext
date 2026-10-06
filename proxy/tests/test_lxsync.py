@@ -316,6 +316,9 @@ def lx_routes(tmp_path, monkeypatch):
     appmod._FAKE_GUID_REVERSE.clear()
     monkeypatch.setitem(CONF, "cache_dir", str(tmp_path / "cache"))
     monkeypatch.setitem(CONF, "fav_dir", str(tmp_path / "fav"))
+    # 洛雪音源在跑：曲目列表按可播性过滤（_source_enabled），测试里显式打开
+    monkeypatch.setitem(CONF, "lx_enabled", True)
+    monkeypatch.setitem(CONF, "lx_sources", [])
     os.makedirs(CONF["cache_dir"], exist_ok=True)
 
     def upstream(request: httpx.Request) -> httpx.Response:

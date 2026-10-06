@@ -558,7 +558,9 @@ def _upstream_handler(request: httpx.Request) -> httpx.Response:
 
 
 def test_playlist_list_follows_custom_channel_order(registry_dir, monkeypatch):
+    from proxy.app import CONF
     monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
+    monkeypatch.setitem(CONF, "netease_enabled", True)  # 频道歌单由音乐盒提供：当前音源须是网易云
     """大类顺序配置必须左右注入顺序（含 daily 的位置），时间戳严格递减。"""
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist,daily,mine")
@@ -652,6 +654,8 @@ def test_apply_explicit_order_overrides_and_appends():
 
 def test_playlist_list_applies_manual_order(registry_dir, monkeypatch):
     monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
+    from proxy.app import CONF
+    monkeypatch.setitem(CONF, "netease_enabled", True)  # 频道歌单由音乐盒提供：当前音源须是网易云
     """playlist_list 注入顺序被手动 token 列表整体覆盖（每日推荐可被排到后面）。"""
     import httpx as _hx
     from fastapi.testclient import TestClient as _TC
@@ -688,6 +692,8 @@ def test_playlist_list_applies_manual_order(registry_dir, monkeypatch):
 
 def test_playlists_preview_endpoint(registry_dir, monkeypatch):
     monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
+    from proxy.app import CONF
+    monkeypatch.setitem(CONF, "netease_enabled", True)  # 频道歌单由音乐盒提供：当前音源须是网易云
     """管理页「歌单顺序」卡片的数据源：清单与顺序和 playlist_list 同源。"""
     import httpx as _hx
     from fastapi.testclient import TestClient as _TC

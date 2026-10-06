@@ -18,7 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from proxy import netease_auth, playlists as pl
-from proxy.app import app
+from proxy.app import CONF, app
 
 
 GUID = "online:playlist:ne:424242"
@@ -77,6 +77,8 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "3600")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "toplist")
     monkeypatch.delenv("FNMUSIC_NETEASE_PLAYLIST_ORDER", raising=False)
+    # 频道歌单由音乐盒提供：当前音源不是网易云时整体不注入（见 playlist_list 门控）
+    monkeypatch.setitem(CONF, "netease_enabled", True)
     pl._reset_live_env_cache_for_test()
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix")

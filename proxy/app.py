@@ -710,8 +710,30 @@ def _search_scope(request: Request) -> str:
     return hashlib.sha256(json.dumps([auth, config, filters, request.url.path], sort_keys=True).encode()).hexdigest()
 
 
+def _lx_netease_fallback(guid: str) -> bool:
+    """洛雪曲目是否该借网易云链路播放。
+
+    洛雪同步歌单里 wy 平台曲目的 id 就是网易云 songId（tx/kg/kw/mg 的 id 空间不同，
+    不能混用）。当前音源是网易云时洛雪服务没在跑，这些曲目若不兜底就是「歌单能加载、
+    点开全部 404」（用户报「用网易云音源 + 同步洛雪歌单都无法播放」）。
+    """
+    if CONF.get("lx_enabled") or not CONF.get("netease_enabled"):
+        return False
+    parts = str(guid or "").split(":")
+    return (len(parts) >= 4 and parts[0] == "online" and parts[1] == "lx"
+            and parts[2] == "wy" and parts[3].isdigit())
+
+
+def _lx_netease_guid(guid: str) -> str:
+    """online:lx:wy:<songId> → online:netease:<songId>（仅用于元信息/直链解析）。"""
+    return "online:netease:" + str(guid or "").split(":")[-1]
+
+
 def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
+    # 跨音源兜底先判：洛雪关、网易云开时 wy 曲目仍可播（见 _lx_netease_fallback）
+    if source == "lx" and _lx_netease_fallback(guid):
+        return True
     if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled")):
         return False
     if source == "lx":
@@ -3656,10 +3678,13 @@ async def ext_playlists_preview():
             "track_count": 0,
         })
     channel_recs: list[dict] = []
-    try:
-        channel_recs, _keep, _complete = await _channel_playlist_records(client)
-    except Exception as exc:  # noqa: BLE001 - 预览接口不该 500
-        logger.warning("playlist preview: channel records failed: %s: %s", type(exc).__name__, exc)
+    # 与歌单列表同一门控：当前音源不是网易云时不列网易云频道歌单（预览要如实反映
+    # 实际注入结果，否则用户会以为它们本该出现）
+    if CONF.get("netease_enabled"):
+        try:
+            channel_recs, _keep, _complete = await _channel_playlist_records(client)
+        except Exception as exc:  # noqa: BLE001 - 预览接口不该 500
+            logger.warning("playlist preview: channel records failed: %s: %s", type(exc).__name__, exc)
     for rec in channel_recs:
         items.append({
             "guid": rec.get("guid"),
@@ -3696,6 +3721,9 @@ async def ext_playlists_preview():
 @app.post("/_ext/playlists/warm")
 async def ext_playlists_warm():
     """手动预热按钮（W6）：刷新当前口径下所有频道歌单的曲目缓存。"""
+    if not CONF.get("netease_enabled"):
+        # 频道歌单只能由 musicbox 提供，当前音源不是网易云时没有可预热的目标
+        return {"ok": True, "data": {"started": False, "reason": "netease_disabled"}}
     client = get_musicbox_client(app)
     try:
         recs, keep, complete = await _channel_playlist_records(client)
@@ -4548,6 +4576,10 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                               force_mp3: bool = False):
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
+    # 跨音源兜底（见 _lx_netease_fallback）：洛雪歌单里的网易云曲目在当前音源为
+    # 网易云时改走网易云解析，元信息也按等价的网易云 guid 取。
+    lx_via_netease = _lx_netease_fallback(guid)
+    info_guid = _lx_netease_guid(guid) if lx_via_netease else guid
     info, _ = _retained_track(request, guid)
     # UA 必须显式带上：kuwo 这类 CDN 见到 python-httpx 的默认 UA 直接 403，
     # 表现为「lx 音源部分歌自动下一曲」（实测 kw 全挂、wy/tx 正常）。
@@ -4560,7 +4592,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     ext = None
     try:
         if source in ("netease", "lx"):
-            if source == "netease":
+            if source == "netease" or lx_via_netease:
                 # 带 stats ⇒ 播放链路启用直链短缓存：预热灌进来的链在这里零往返命中，
                 # 命中与否也会被记录（供统计区分 warm/cold）。
                 url = await resolve_netease_url(
@@ -4582,7 +4614,7 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
                         headers[key] = str(value)
             if info is None:
                 try:
-                    info = await asyncio.wait_for(_fetch_online_info(request, guid), timeout=0.75)
+                    info = await asyncio.wait_for(_fetch_online_info(request, info_guid), timeout=0.75)
                 except Exception as exc:
                     logger.info("online info fast-path missed for %s: %s", guid, type(exc).__name__)
             ext = ext or (info or {}).get("ext")
@@ -5505,6 +5537,10 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
         return Response(status_code=full.status_code, headers=dict(full.headers))
+    if not _source_enabled(guid):
+        # 与 GET 路径同一门控：源未启用/平台被过滤时立刻 404，不再对着停掉的服务
+        # 逐个音质白等（实测 HEAD 探针每轨 3×22s，播放器表现为一直转圈/跳下一曲）。
+        return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
     opened = None
     try:
         opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
@@ -5691,7 +5727,9 @@ def _prefetch_if_needed(request: Request, from_guid: str, next_guid: str) -> int
         prefetch.bump("no_next")
         return 0
     # A 的三音源：只有网易云有直链短缓存可灌，lx/musicdl 的解析路径不同，不预热。
-    if source_from_online_guid(next_guid) != "netease":
+    # 例外：洛雪 wy 曲目借网易云链路播放时走的是同一条网易云解析/短缓存（见
+    # _lx_netease_fallback），照样能预热。
+    if source_from_online_guid(next_guid) != "netease" and not _lx_netease_fallback(next_guid):
         prefetch.bump("no_next")
         return 0
     if prefetch.warming_seconds(next_guid) is not None or not prefetch.claim(next_guid):
@@ -5856,7 +5894,7 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
         return None, None
     source = source_from_online_guid(guid)
     try:
-        if source == "netease":
+        if source == "netease" or _lx_netease_fallback(guid):
             url = await resolve_netease_url(
                 get_musicbox_client(request.app), song_id_from_online_guid(guid).split(":")[-1],
                 request)
@@ -6230,6 +6268,9 @@ async def _online_info(request: Request, guid: str, include_lyric: bool = True) 
 
 
 async def _fetch_online_info(request: Request, guid: str, include_lyric: bool = True) -> dict | None:
+    if _lx_netease_fallback(guid):
+        # 跨音源兜底（见 _lx_netease_fallback）：洛雪 wy 曲目按等价的网易云曲目取元信息
+        return await _fetch_online_info(request, _lx_netease_guid(guid), include_lyric=include_lyric)
     src = source_from_online_guid(guid)
     if src == "netease":
         musicbox_client = get_musicbox_client(request.app)
@@ -8041,16 +8082,20 @@ async def playlist_list(request: Request):
     # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
     nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
     # W6 频道歌单（榜/分类/我的/新碟/电台）：SWR 内存缓存，上游不可用时返回空表
+    # 网易云频道/账号歌单只能由 musicbox 服务提供。当前音源是洛雪/网盘时 musicbox
+    # 未启动，硬拉只会白等一轮（用户报「用洛雪音源时网易云歌单一直加载不出来」）；
+    # 此时直接不注入，切回网易云音源后自然出现。
     channel_recs: list[dict] = []
     keep: set[str] = set()
     complete = False
-    try:
-        channel_recs, keep, complete = await _channel_playlist_records(get_musicbox_client(request.app))
-        if complete:
-            playlists.forget_stale(keep)
-    except Exception as e:  # noqa: BLE001 - 频道清单失败不能拖垮官方歌单列表
-        logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
-        channel_recs = []
+    if CONF.get("netease_enabled"):
+        try:
+            channel_recs, keep, complete = await _channel_playlist_records(get_musicbox_client(request.app))
+            if complete:
+                playlists.forget_stale(keep)
+        except Exception as e:  # noqa: BLE001 - 频道清单失败不能拖垮官方歌单列表
+            logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
+            channel_recs = []
     if not kinds and not nm_on and not channel_recs and not lxsync.sync_enabled():
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）、账号歌单与频道清单都为空：不注入
         return JSONResponse(content=envelope, headers=headers)
@@ -8364,9 +8409,12 @@ async def playlist_track_list(request: Request):
         is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
         if not is_authed and auth_resp is not None:
             return auth_resp
-        tracks = dailyrec.stamp_playlist_tracks(
-            await lxsync.load_tracks(lx_pid, build_online_track)
-        )
+        tracks = dailyrec.stamp_playlist_tracks([
+            t for t in await lxsync.load_tracks(lx_pid, build_online_track)
+            # 当前音源取不到的曲目直接不列（洛雪关、网易云开时只剩可借网易云播放的
+            # wy 曲目）：免得「点开一首跳一首」，与 _online_window 的过滤口径一致。
+            if _source_enabled(online_guid_from_item(t))
+        ])
         _remember_prefetch_context(request, guid, tracks)
         try:
             page = max(int(request.query_params.get("page") or 1), 1)
