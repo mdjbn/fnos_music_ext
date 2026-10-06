@@ -77,6 +77,8 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LX_SYNC_REFRESH_S", "300"),
     ("FNMUSIC_LX_SYNC_DEVICE", "fnmusic-ext"),
     ("FNMUSIC_LX_SYNC_INSECURE_TLS", "false"),
+    # 歌单回写档位：off（只读，默认）/ tracks（歌单内增删歌）/ all（还能删整张歌单）
+    ("FNMUSIC_LX_SYNC_WRITEBACK", "off"),
     ("FNMUSIC_QUALITY_WIFI", "lossless"),
     ("FNMUSIC_QUALITY_CELLULAR", "exhigh"),
     ("FNMUSIC_QUALITY_DB_RESCAN", "300"),

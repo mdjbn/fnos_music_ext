@@ -561,6 +561,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_LX_SYNC_REFRESH_S": ("", "str"),
     "FNMUSIC_LX_SYNC_DEVICE": ("", "str"),
     "FNMUSIC_LX_SYNC_INSECURE_TLS": ("", "str"),
+    "FNMUSIC_LX_SYNC_WRITEBACK": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -7454,8 +7455,27 @@ async def playlist_add_track(request: Request):
     if nmpl.is_nm_playlist_guid(playlist_guid):
         # 网易账号歌单只读（不回写网易）：同样吸收请求
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
-    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(playlist_guid)):
-        # 洛雪同步歌单只读：要改请去洛雪客户端改，改了下次同步自动生效
+    lx_pl_id = lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(playlist_guid))
+    if lx_pl_id:
+        if not lxsync.writeback_tracks_enabled():
+            # 只读档（默认）：吸收请求。要改请去洛雪客户端改，下次同步自动生效
+            return JSONResponse(content={"code": 0, "msg": "", "data": None})
+        items = []
+        for raw in track_guids:
+            guid = resolve_real_guid(str(raw or "").strip())
+            if not guid.startswith("online:lx:"):
+                continue          # 只回写 lx 音源的曲目：别的来源洛雪那边认不出来
+            info = await _best_effort_online_info(request, guid) or {}
+            items.append({"id": guid, "title": info.get("title"), "artist": info.get("artist"),
+                          "album": info.get("album"), "duration_s": info.get("duration_s"),
+                          "cover_url": info.get("cover_url")})
+        try:
+            count = await lxsync.add_tracks(lx_pl_id, items)
+        except Exception as exc:  # noqa: BLE001 - 写失败必须让客户端看得见，不能假成功
+            logger.warning("lx writeback add failed (%s): %s: %s", lx_pl_id, type(exc).__name__, exc)
+            return JSONResponse(content={"code": 502, "msg": f"写回洛雪歌单失败：{exc}"[:200], "data": None},
+                                status_code=502)
+        logger.info("lx writeback: added %d track(s) to %s", count, lx_pl_id)
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
@@ -7519,7 +7539,18 @@ async def playlist_remove_track(request: Request):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
     if nmpl.is_nm_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
-    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(playlist_guid)):
+    lx_pl_id = lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(playlist_guid))
+    if lx_pl_id:
+        if not lxsync.writeback_tracks_enabled():
+            return JSONResponse(content={"code": 0, "msg": "", "data": None})
+        guids = [resolve_real_guid(str(raw or "").strip()) for raw in track_guids]
+        try:
+            count = await lxsync.remove_tracks(lx_pl_id, guids)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("lx writeback remove failed (%s): %s: %s", lx_pl_id, type(exc).__name__, exc)
+            return JSONResponse(content={"code": 502, "msg": f"从洛雪歌单移除失败：{exc}"[:200], "data": None},
+                                status_code=502)
+        logger.info("lx writeback: removed %d track(s) from %s", count, lx_pl_id)
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
@@ -7575,8 +7606,18 @@ async def playlist_delete(request: Request):
     if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
         # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
-    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(_pl_guid)):
-        # 洛雪同步歌单只读：本地删不掉（服务端是权威），下次同步仍在
+    lx_pl_id = lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(_pl_guid))
+    if lx_pl_id:
+        if not lxsync.writeback_all_enabled():
+            # 默认档：洛雪同步歌单在本地删不掉（服务端是权威），下次同步仍在
+            return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+        try:
+            await lxsync.remove_playlist(lx_pl_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("lx writeback delete failed (%s): %s: %s", lx_pl_id, type(exc).__name__, exc)
+            return JSONResponse(content={"code": 502, "msg": f"删除洛雪歌单失败：{exc}"[:200], "data": None},
+                                status_code=502)
+        logger.info("lx writeback: removed playlist %s", lx_pl_id)
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):

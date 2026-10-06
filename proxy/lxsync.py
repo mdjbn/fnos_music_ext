@@ -80,6 +80,27 @@ def refresh_s() -> float:
         return _REFRESH_DEFAULT_S
 
 
+_WRITEBACK_MODES = ("off", "tracks", "all")
+
+
+def writeback_mode() -> str:
+    """歌单回写档位（默认 off，保持只读）：
+    * off    —— 在飞牛里加/删歌、删歌单一律"吸收"，不动洛雪那边；
+    * tracks —— 允许把歌加进/移出洛雪歌单；
+    * all    —— 再允许从飞牛删掉整张洛雪歌单（对所有设备生效，破坏性）。
+    """
+    raw = str(os.environ.get("FNMUSIC_LX_SYNC_WRITEBACK", "") or "off").strip().lower()
+    return raw if raw in _WRITEBACK_MODES else "off"
+
+
+def writeback_tracks_enabled() -> bool:
+    return sync_enabled() and writeback_mode() in ("tracks", "all")
+
+
+def writeback_all_enabled() -> bool:
+    return sync_enabled() and writeback_mode() == "all"
+
+
 def home_dir() -> str:
     env = (os.environ.get("FNMUSIC_HOME") or "").strip()
     if env:
@@ -223,18 +244,21 @@ def track_item(song: dict) -> "dict | None":
 _state: dict[str, Any] = {
     "cards": [],          # 注入飞牛歌单列表的卡片
     "tracks": {},         # guid → [lx 歌曲 dict]（原始形态，按需转换）
+    "index": {},          # "<src>:<ident>" → 洛雪原始歌曲（回写时取原对象，保真）
     "saved_at": 0.0,      # 上次成功同步时间（monotonic）
     "fail_until": 0.0,
     "id_map": {},         # token → 服务端歌单 id
     "error": "",
 }
 _lock = asyncio.Lock()
+# 同一 clientId 的同步/回写连接串行化（服务端会踢重复 client，见 _do_refresh 注释）
+_session_lock = asyncio.Lock()
 _refresh_task: "asyncio.Task | None" = None
 
 
 def reset_for_test() -> None:
     global _refresh_task
-    _state.update({"cards": [], "tracks": {}, "saved_at": 0.0, "fail_until": 0.0,
+    _state.update({"cards": [], "tracks": {}, "index": {}, "saved_at": 0.0, "fail_until": 0.0,
                    "id_map": {}, "error": ""})
     _refresh_task = None
 
@@ -275,6 +299,7 @@ def status() -> dict:
         "device": device_name(),
         "insecure_tls": lxproto.tls_insecure(),
         "refresh_s": refresh_s(),
+        "writeback": writeback_mode(),
         "playlists": len(_state["cards"]),
         "tracks": {str(c.get("guid")): len(_state["tracks"].get(str(c.get("guid")) or "", []))
                    for c in _state["cards"]},
@@ -344,26 +369,36 @@ async def _do_refresh(timeout: float) -> bool:
         _state["error"] = "未配置同步服务地址或密码"
         return False
     ident = lxproto.load_identity(identity_path())
-    try:
-        result = await lxproto.sync_session(
-            url, pwd, device_name=device_name(),
-            client_id=ident.get("client_id", ""), key_b64=ident.get("key", ""),
-            timeout=timeout,
-        )
-    except lxproto.LxSyncError as exc:
-        _state["error"] = str(exc)
-        _state["fail_until"] = time.monotonic() + _FAIL_COOLDOWN_S
-        logger.warning("lx sync failed: %s", exc)
-        return False
-    except Exception as exc:  # noqa: BLE001
-        _state["error"] = f"{type(exc).__name__}: {exc}"
-        _state["fail_until"] = time.monotonic() + _FAIL_COOLDOWN_S
-        logger.warning("lx sync error: %s: %s", type(exc).__name__, exc)
-        return False
+    # ⚠️ 同一个 clientId 只允许一条连接：服务端 checkDuplicateClient() 会把先连的那条**踢掉**
+    #    （`src/server/server.ts:41-51`）。所以前台同步、后台 SWR 刷新、回写连接共用这把锁，
+    #    否则两个协程一撞，服务端就把正在用的那条连接掐了（表现为读到空歌单、写没生效）。
+    async with _session_lock:
+        try:
+            result = await lxproto.sync_session(
+                url, pwd, device_name=device_name(),
+                client_id=ident.get("client_id", ""), key_b64=ident.get("key", ""),
+                timeout=timeout,
+            )
+        except lxproto.LxSyncError as exc:
+            _state["error"] = str(exc)
+            _state["fail_until"] = time.monotonic() + _FAIL_COOLDOWN_S
+            logger.warning("lx sync failed: %s", exc)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            _state["error"] = f"{type(exc).__name__}: {exc}"
+            _state["fail_until"] = time.monotonic() + _FAIL_COOLDOWN_S
+            logger.warning("lx sync error: %s: %s", type(exc).__name__, exc)
+            return False
     if result.get("paired"):
         lxproto.save_identity(identity_path(), result["client_id"], result["key"])
     cards, tracks, id_map = _build_state(result.get("list_data") or {})
-    _state.update({"cards": cards, "tracks": tracks, "id_map": id_map,
+    index: dict[str, dict] = {}
+    for songs in tracks.values():
+        for song in songs:
+            src, ident = _identifier_of(song)
+            if src:
+                index.setdefault(f"{src}:{ident}", song)
+    _state.update({"cards": cards, "tracks": tracks, "index": index, "id_map": id_map,
                    "saved_at": time.monotonic(), "fail_until": 0.0, "error": ""})
     logger.info("lx sync ok: %d playlists (%s)", len(cards), "paired" if result.get("paired") else "reuse")
     return True
@@ -429,3 +464,145 @@ def schedule_prefetch() -> None:
     """列表页顺带预热（冷却/在途由 _schedule_refresh 内部把关）。"""
     if sync_enabled() and _state["saved_at"] and (time.monotonic() - _state["saved_at"]) >= refresh_s():
         _schedule_refresh()
+
+
+# ---------------------------------------------------------------------------
+# 歌单回写（FNMUSIC_LX_SYNC_WRITEBACK，默认 off 保持只读）
+# ---------------------------------------------------------------------------
+
+def raw_song_for_guid(guid: str) -> "dict | None":
+    """飞牛在线 guid/曲目 id（`online:lx:<src>:<ident>`）→ 洛雪原始歌曲对象。"""
+    text = str(guid or "")
+    if text.startswith("online:"):
+        text = text[len("online:"):]
+    if not text.startswith("lx:"):
+        return None
+    parts = text.split(":", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2]:
+        return None
+    return _state["index"].get(f"{parts[1]}:{parts[2]}")
+
+
+def song_from_item(item: dict) -> "dict | None":
+    """飞牛侧曲目（搜索来的歌）→ 洛雪 MusicInfo。
+
+    只有平台主键 + 标题/歌手/专辑/时长/封面，拿不到洛雪的 `qualitys`/`types`：
+    客户端播放时会自己重解析品质——这也是回写默认关、要用户自己开的原因。
+    已在同步缓存里的歌一律返回**原始对象**，字段完整、保真。
+    """
+    text = str(item.get("id") or item.get("guid") or "")
+    if text.startswith("online:"):
+        text = text[len("online:"):]
+    src, ident = "", ""
+    if text.startswith("lx:"):
+        parts = text.split(":", 2)
+        if len(parts) == 3:
+            src, ident = parts[1].strip().lower(), parts[2].strip()
+    if src not in _LX_SOURCES:
+        src = str(item.get("lx_source") or "").strip().lower()
+        ident = _clean_ident(src, item.get("song_id") or item.get("ident") or "") if src else ""
+    if src not in _LX_SOURCES or not ident:
+        return None
+    cached = _state["index"].get(f"{src}:{ident}")
+    if cached:
+        return cached
+    try:
+        secs = int(float(item.get("duration_s") or 0))
+    except (TypeError, ValueError):
+        secs = 0
+    meta: dict = {"songId": ident, "albumName": str(item.get("album") or ""),
+                  "picUrl": str(item.get("cover_url") or "")}
+    if src == "tx":
+        meta.update({"songmid": ident, "strMediaMid": ident})
+    elif src == "kg":
+        meta["hash"] = ident
+    elif src == "mg":
+        meta["copyrightId"] = ident
+    return {"id": f"{src}_{ident}", "name": str(item.get("title") or ""),
+            "singer": str(item.get("artist") or ""), "source": src,
+            "interval": (f"{secs // 60:02d}:{secs % 60:02d}" if secs else ""), "meta": meta}
+
+
+def _song_id_for(guid: str) -> str:
+    """洛雪歌曲自己的 id（移除曲目时精确匹配用）。缓存里没有就用 `<src>_<ident>` 拼。"""
+    raw = raw_song_for_guid(guid)
+    if isinstance(raw, dict) and raw.get("id"):
+        return str(raw["id"])
+    text = str(guid or "")
+    if text.startswith("online:"):
+        text = text[len("online:"):]
+    if text.startswith("lx:"):
+        parts = text.split(":", 2)
+        if len(parts) == 3 and parts[1] and parts[2]:
+            return f"{parts[1]}_{parts[2]}"
+    return ""
+
+
+async def _write_call(action: dict, timeout: float = _SESSION_TIMEOUT_S) -> Any:
+    """开一条连接并下发一个 onListSyncAction。
+
+    ⚠️ 必须让 list 模块同步跑完再写：服务端的
+    `onListSyncAction` 第一行就是 `if (!socket.moduleReadys?.list) return`
+    （`src/modules/list/sync/handler.ts:195-196`），而 `moduleReadys.list` 只在
+    list 同步结束时才置 true——用 list:false 的"轻量只写连接"实测会**静默不生效**
+    （RPC 正常返回 None、服务端快照原样不变）。代价是服务端会把整份歌单推给我们
+    （我们收下但不入库），换来的是写入真的落盘。
+    """
+    url, pwd = server_url(), password()
+    if not (url and pwd):
+        raise lxproto.LxSyncError("未配置洛雪同步服务地址或密码")
+    ident = lxproto.load_identity(identity_path())
+    conn = lxproto.LxConnection(url, pwd, device_name=device_name(),
+                                client_id=ident.get("client_id", ""), key_b64=ident.get("key", ""),
+                                timeout=timeout)
+    async with _session_lock:          # 与读取/后台刷新串行，避免被服务端当重复 client 踢掉
+        await conn.open()
+        try:
+            conn.start_pump()
+            # 等最外层 finished()：那时 moduleReadys.list 一定已经是 true
+            await conn.wait_for(lambda: conn.finished, timeout)
+            return await conn.call(["onListSyncAction"], action, timeout=timeout)
+        finally:
+            await conn.close()
+
+
+def _after_write() -> None:
+    """写成功后让缓存失效并后台重同步，界面显示服务端的权威结果。"""
+    _state["saved_at"] = 0.0
+    _schedule_refresh()
+
+
+async def add_tracks(lx_pid: str, items: list, position: str = "bottom") -> int:
+    """把歌加进洛雪歌单（list_music_add），返回真正下发的歌曲数。"""
+    songs: list = []
+    for item in items or []:
+        song = song_from_item(item if isinstance(item, dict) else {})
+        if song:
+            songs.append(song)
+    if not songs:
+        raise lxproto.LxSyncError("没有可写回的歌曲（缺少平台主键）")
+    await _write_call({"action": "list_music_add",
+                       "data": {"id": str(lx_pid), "musicInfos": songs,
+                                "addMusicLocationType": "top" if position == "top" else "bottom"}})
+    _after_write()
+    logger.info("lx writeback: add %d track(s) to %s", len(songs), lx_pid)
+    return len(songs)
+
+
+async def remove_tracks(lx_pid: str, guids: list) -> int:
+    """把歌移出洛雪歌单（list_music_remove）；ids 用洛雪歌曲自己的 id，匹配不上就删不到（安全）。"""
+    ids = [sid for sid in (_song_id_for(str(g or "")) for g in guids or []) if sid]
+    if not ids:
+        raise lxproto.LxSyncError("没有可移除的歌曲（guid 对应不到洛雪歌曲）")
+    await _write_call({"action": "list_music_remove",
+                       "data": {"listId": str(lx_pid), "ids": ids}})
+    _after_write()
+    logger.info("lx writeback: remove %d track(s) from %s", len(ids), lx_pid)
+    return len(ids)
+
+
+async def remove_playlist(lx_pid: str) -> None:
+    """删除整张洛雪歌单（list_remove，对所有设备生效，破坏性）。"""
+    await _write_call({"action": "list_remove", "data": [str(lx_pid)]})
+    _after_write()
+    logger.info("lx writeback: removed playlist %s", lx_pid)

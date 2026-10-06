@@ -706,8 +706,12 @@ class LxConnection:
         self.client_id = client_id
         self.key_b64 = key_b64
         self.timeout = timeout
+        # 注意：list 同步**必须**开着（`list_sync_get_list_data` 回空表 + skipSnapshot）。
+        # 关掉它虽然能少收一份歌单，但服务端 `onListSyncAction` 会因 moduleReadys.list
+        # 为 false 直接 return（`src/modules/list/sync/handler.ts:195-196`）⇒ 回写静默不生效。
         self.list_data: "dict | None" = None
-        self.finished = False
+        self.finished = False          # 服务端跑完整个 sync 流程（最外层 finished()）
+        self.list_finished = False     # list 模块同步结束（此后 moduleReadys.list 才为 true）
         self.paired = False
         self._ws: "LxWebSocket | None" = None
         self._rpc: "LxRpc | None" = None
@@ -725,6 +729,10 @@ class LxConnection:
             self.finished = True
             return None
 
+        def on_list_finished(*_a: Any) -> None:
+            self.list_finished = True
+            return None
+
         return {
             "getEnabledFeatures": lambda *_a: {"list": {"skipSnapshot": True}, "dislike": False},
             "finished": on_finished,
@@ -732,7 +740,7 @@ class LxConnection:
             "list_sync_get_md5": lambda *_a: "",
             "list_sync_get_sync_mode": lambda *_a: "overwrite_remote_local_full",
             "list_sync_set_list_data": on_set,
-            "list_sync_finished": on_finished,
+            "list_sync_finished": on_list_finished,
             "onListSyncAction": lambda *_a: "",
         }
 

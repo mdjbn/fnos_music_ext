@@ -328,6 +328,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "lx_sync_refresh_s": ("FNMUSIC_LX_SYNC_REFRESH_S", _int_range(30, 86400), False),
     "lx_sync_device": ("FNMUSIC_LX_SYNC_DEVICE", _free_text(64), False),
     "lx_sync_insecure_tls": ("FNMUSIC_LX_SYNC_INSECURE_TLS", _as_bool, False),
+    "lx_sync_writeback": ("FNMUSIC_LX_SYNC_WRITEBACK", _in_choices("off", "tracks", "all"), False),
     # --- 音质：局域网一档 / 非局域网一档（v2.9.28 起只有这两档）---
     # 「跟随飞牛」「按网络分别设置」「固定音质」三个策略与固定档一并取消：
     # 前两个依赖我们从未可靠拿到的客户端网络线索，第三个则把窄管道照灌母带。
@@ -385,6 +386,7 @@ DEFAULTS = {
     "lx_sync_refresh_s": "300",
     "lx_sync_device": "fnmusic-ext",
     "lx_sync_insecure_tls": "false",
+    "lx_sync_writeback": "off",
     "quality_wifi": "lossless",
     "quality_cellular": "exhigh",
 }
@@ -1873,6 +1875,18 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <input type="checkbox" name="lx_sync_insecure_tls">
           <span class="ht">只在服务端用<b>自签 https 证书</b>时才需要勾（勾了之后到该地址的流量不再校验身份，能被人中间人替换；
             域名证书正常时不要勾）</span>
+        </label>
+
+        <label><span class="lb">洛雪歌单回写档位</span>
+          <select name="lx_sync_writeback">
+            <option value="off">只读 off（默认）</option>
+            <option value="tracks">可增删歌 tracks</option>
+            <option value="all">可增删歌 + 可删歌单 all</option>
+          </select>
+          <span class="ht"><b>off</b>：飞牛里加/删歌只是本地动作，洛雪那边不变；
+            <b>tracks</b>：把歌加入/移出洛雪歌单会真的写回同步服务（电脑手机会看到）；
+            <b>all</b>：额外允许在飞牛里删掉整张洛雪歌单——<b>对所有设备生效</b>（服务端保留快照，误删可在管理控制台还原）。
+            从搜索里新加的歌缺少洛雪的品质档字段，客户端播放时会自行重解析（能播，属降级写入）</span>
         </label>
 
         <label><span class="lb">音质：局域网（家里 WiFi / 内网）</span>
