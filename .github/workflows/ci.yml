@@ -4,6 +4,8 @@ on:
   push:
     branches: [main, dev]
   pull_request:
+  # 允许在 Actions 页面手动触发（fork 首次启用 Actions 后想立刻验一轮时尤其有用）
+  workflow_dispatch:
 
 permissions:
   contents: read
