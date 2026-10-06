@@ -70,6 +70,13 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_DOWNLOAD_ON_FAVORITE", "false"),
     # A 侧决策：往**用户网易云账号**写红心是对账号的写操作，默认关，要用户自己开
     ("FNMUSIC_FAV_SYNC_LIKE", "false"),
+    # 洛雪音乐同步服务器（lx-music-sync-server）歌单同步：默认关，要用户填地址+密码
+    ("FNMUSIC_LX_SYNC_ENABLED", "false"),
+    ("FNMUSIC_LX_SYNC_URL", ""),
+    ("FNMUSIC_LX_SYNC_PASSWORD", ""),
+    ("FNMUSIC_LX_SYNC_REFRESH_S", "300"),
+    ("FNMUSIC_LX_SYNC_DEVICE", "fnmusic-ext"),
+    ("FNMUSIC_LX_SYNC_INSECURE_TLS", "false"),
     ("FNMUSIC_QUALITY_WIFI", "lossless"),
     ("FNMUSIC_QUALITY_CELLULAR", "exhigh"),
     ("FNMUSIC_QUALITY_DB_RESCAN", "300"),

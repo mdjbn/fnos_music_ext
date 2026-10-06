@@ -321,6 +321,13 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
     "fav_sync_like": ("FNMUSIC_FAV_SYNC_LIKE", _as_bool, False),
+    # --- 洛雪音乐同步服务器歌单（只读注入飞牛歌单列表）---
+    "lx_sync_enabled": ("FNMUSIC_LX_SYNC_ENABLED", _as_bool, False),
+    "lx_sync_url": ("FNMUSIC_LX_SYNC_URL", _http_url, False),
+    "lx_sync_password": ("FNMUSIC_LX_SYNC_PASSWORD", _free_text(200), True),
+    "lx_sync_refresh_s": ("FNMUSIC_LX_SYNC_REFRESH_S", _int_range(30, 86400), False),
+    "lx_sync_device": ("FNMUSIC_LX_SYNC_DEVICE", _free_text(64), False),
+    "lx_sync_insecure_tls": ("FNMUSIC_LX_SYNC_INSECURE_TLS", _as_bool, False),
     # --- 音质：局域网一档 / 非局域网一档（v2.9.28 起只有这两档）---
     # 「跟随飞牛」「按网络分别设置」「固定音质」三个策略与固定档一并取消：
     # 前两个依赖我们从未可靠拿到的客户端网络线索，第三个则把窄管道照灌母带。
@@ -372,6 +379,12 @@ DEFAULTS = {
     "download_dir": "",
     "download_on_favorite": "false",
     "fav_sync_like": "false",
+    "lx_sync_enabled": "false",
+    "lx_sync_url": "",
+    "lx_sync_password": "",
+    "lx_sync_refresh_s": "300",
+    "lx_sync_device": "fnmusic-ext",
+    "lx_sync_insecure_tls": "false",
     "quality_wifi": "lossless",
     "quality_cellular": "exhigh",
 }
@@ -1828,6 +1841,40 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">点收藏/取消收藏时同步写你网易云账号的红心（双向）。这是对账号的写操作，默认关闭；需要登录态可用</span>
         </label>
 
+        <label><span class="lb">同步洛雪歌单</span>
+          <input type="checkbox" name="lx_sync_enabled">
+          <span class="ht">把 lx-music-sync-server（洛雪客户端的同步服务）里的歌单，作为<b>只读</b>歌单注入飞牛音乐的歌单列表。
+            只读：在飞牛这边加/删歌不会写回服务端，要改请去洛雪客户端改，改完等下一次同步自动生效</span>
+        </label>
+
+        <label><span class="lb">洛雪同步服务地址</span>
+          <input name="lx_sync_url" placeholder="http://192.168.1.10:9527">
+          <span class="ht">就是洛雪客户端「设置 → 同步 → 同步服务地址」里填的那个（默认端口 9527）。填错会在保存时直接报错</span>
+        </label>
+
+        <label><span class="lb">洛雪同步服务密码</span>
+          <input type="password" name="lx_sync_password" placeholder="留空表示不修改" autocomplete="new-password">
+          <span class="ht">服务端 config.js 里 <code>users[].password</code>（或环境变量 <code>LX_USER_&lt;用户名&gt;</code>）的那个密码。
+            用户名不用填：服务端是拿密码去匹配账号的。<b>留空 = 保持原值</b></span>
+        </label>
+
+        <label><span class="lb">洛雪歌单刷新间隔（秒）</span>
+          <input name="lx_sync_refresh_s" inputmode="numeric" placeholder="300">
+          <span class="ht">默认 300。第一次打开歌单列表会等一次同步（最多 8 秒），之后都读缓存、后台按这个间隔刷新；
+            服务端连不上时继续显示上一次的结果，不会让歌单列表变空</span>
+        </label>
+
+        <label><span class="lb">本机在洛雪同步里的设备名</span>
+          <input name="lx_sync_device" placeholder="fnmusic-ext">
+          <span class="ht">只影响同步服务「设备列表」里显示的名字，方便你认出这是飞牛插件而不是手机/电脑客户端</span>
+        </label>
+
+        <label><span class="lb">跳过同步服务的证书校验</span>
+          <input type="checkbox" name="lx_sync_insecure_tls">
+          <span class="ht">只在服务端用<b>自签 https 证书</b>时才需要勾（勾了之后到该地址的流量不再校验身份，能被人中间人替换；
+            域名证书正常时不要勾）</span>
+        </label>
+
         <label><span class="lb">音质：局域网（家里 WiFi / 内网）</span>
           <select name="quality_wifi">
             <option value="standard">标准 standard（128k）</option>
@@ -2014,7 +2061,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like","log_quiet"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like","lx_sync_enabled","lx_sync_insecure_tls","log_quiet"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。

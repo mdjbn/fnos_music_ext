@@ -47,6 +47,7 @@ try:
     from . import trimgw
     from . import pushplus
     from . import download as downloader
+    from . import lxsync
     from .cache_gc import purge_rolling, sweep_orphan_lyrics
     from .env_merge import parse_env_file
     from .version import get_version
@@ -63,6 +64,7 @@ except ImportError:  # uvicorn --app-dir proxy
     import trimgw  # type: ignore
     import pushplus  # type: ignore
     import download as downloader  # type: ignore
+    import lxsync  # type: ignore
     from cache_gc import purge_rolling, sweep_orphan_lyrics  # type: ignore
     from env_merge import parse_env_file  # type: ignore
     from version import get_version  # type: ignore
@@ -551,6 +553,14 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_DOWNLOAD_DIR": ("", "str"),
     "FNMUSIC_DOWNLOAD_ON_FAVORITE": ("", "str"),
     "FNMUSIC_FAV_SYNC_LIKE": ("", "str"),
+    # 洛雪音乐同步服务器（lx-music-sync-server）歌单同步：lxsync.py 直接读 os.environ，
+    # 同理必须进白名单，否则管理页填完要重启才生效。
+    "FNMUSIC_LX_SYNC_ENABLED": ("", "str"),
+    "FNMUSIC_LX_SYNC_URL": ("", "str"),
+    "FNMUSIC_LX_SYNC_PASSWORD": ("", "str"),
+    "FNMUSIC_LX_SYNC_REFRESH_S": ("", "str"),
+    "FNMUSIC_LX_SYNC_DEVICE": ("", "str"),
+    "FNMUSIC_LX_SYNC_INSECURE_TLS": ("", "str"),
 }
 _ENV_WATCH_INTERVAL_S = 2.0
 _ENV_WATCH_DEBOUNCE_S = 0.5
@@ -3477,6 +3487,32 @@ async def ext_local_first():
         return {"ok": True, "data": rep}
     except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
         logger.warning("local first diag failed: %s: %s", type(exc).__name__, exc)
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
+
+
+@app.get("/_ext/lxsync")
+async def ext_lx_sync(refresh: int = 0):
+    """洛雪音乐同步服务器歌单同步的状态快照（只读；`refresh=1` 时顺带拉一次）。
+
+    这个功能同样是「连不上/没配对」时界面上毫无迹象的类型：歌单不出现，用户只能猜。
+    这里把地址、是否配了密码、上次成功时间、每张歌单的可播曲目数与最近错误摊开。
+    不回显密码，只回「有没有配」。
+    """
+    try:
+        if refresh and lxsync.sync_enabled():
+            await lxsync.peek_summaries()
+        rep = lxsync.status()
+        rep["hint"] = ""
+        if not rep["enabled"]:
+            rep["hint"] = "未开启：管理页勾上「同步洛雪歌单」并填服务地址与密码。"
+        elif rep["error"]:
+            rep["hint"] = f"上次同步失败：{rep['error']}。歌单列表会继续显示上一次成功的结果。"
+        elif not rep["playlists"]:
+            rep["hint"] = ("已连上但没有歌单：确认洛雪客户端里已经往这个同步服务推过数据"
+                           "（客户端 → 设置 → 同步 → 上传）。")
+        return {"ok": True, "data": rep}
+    except Exception as exc:  # noqa: BLE001 - 诊断端点不该 500
+        logger.warning("lx sync diag failed: %s: %s", type(exc).__name__, exc)
         return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:200], "data": {}}
 
 
@@ -6548,6 +6584,14 @@ async def static_cover(request: Request, subpath: str = ""):
         if cover:
             return RedirectResponse(cover, status_code=302)
         return Response(status_code=404)
+    lx_pid = (lxsync.lxsync_playlist_id_from_guid(guid)
+              or lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(guid)))
+    if lx_pid:
+        # 洛雪歌单没有独立封面：用第一首能拿到封面的歌的 picUrl，取不到就用默认图（404）
+        cover = lxsync.cover_url_for(lx_pid)
+        if cover:
+            return RedirectResponse(cover, status_code=302)
+        return Response(status_code=404)
     if not is_online_guid(guid):
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
@@ -7410,6 +7454,9 @@ async def playlist_add_track(request: Request):
     if nmpl.is_nm_playlist_guid(playlist_guid):
         # 网易账号歌单只读（不回写网易）：同样吸收请求
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(playlist_guid)):
+        # 洛雪同步歌单只读：要改请去洛雪客户端改，改了下次同步自动生效
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -7472,6 +7519,8 @@ async def playlist_remove_track(request: Request):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
     if nmpl.is_nm_playlist_guid(playlist_guid):
         return JSONResponse(content={"code": 0, "msg": "", "data": None})
+    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(playlist_guid)):
+        return JSONResponse(content={"code": 0, "msg": "", "data": None})
 
     online = [g for g in (resolve_real_guid(g) for g in track_guids) if is_online_guid(g)]
     if not online:
@@ -7525,6 +7574,9 @@ async def playlist_delete(request: Request):
     _pl_guid = str(_body.get("guid") or "").strip() if isinstance(_body, dict) else ""
     if nmpl.is_nm_playlist_guid(resolve_real_guid(_pl_guid)):
         # 网易账号歌单只读：吸收删除（不透传官方必被拒的假 id），下次刷新卡片仍在
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
+    if lxsync.is_lxsync_playlist_guid(resolve_real_guid(_pl_guid)):
+        # 洛雪同步歌单只读：本地删不掉（服务端是权威），下次同步仍在
         return JSONResponse(content={"code": 0, "msg": "ok", "data": None})
     envelope = await fetch_upstream_envelope(request, upstream_client)
     if isinstance(envelope, Response):
@@ -7892,7 +7944,7 @@ async def playlist_list(request: Request):
     except Exception as e:  # noqa: BLE001 - 频道清单失败不能拖垮官方歌单列表
         logger.warning("channel playlist inject failed: %s: %s", type(e).__name__, e)
         channel_recs = []
-    if not kinds and not nm_on and not channel_recs:
+    if not kinds and not nm_on and not channel_recs and not lxsync.sync_enabled():
         # 两个推荐开关全关（或 shared 会话无任何可注入类型）、账号歌单与频道清单都为空：不注入
         return JSONResponse(content=envelope, headers=headers)
 
@@ -7943,16 +7995,33 @@ async def playlist_list(request: Request):
             nm_cards = []
         if nm_cards:
             nmpl.schedule_prefetch(get_musicbox_client(request.app), build_online_track, nm_cards)
+    # 洛雪音乐同步服务器歌单：只读虚拟歌单（SWR，服务端连不上时保留上一次的卡片）
+    lx_cards: list[dict] = []
+    if lxsync.sync_enabled():
+        try:
+            lx_cards = await lxsync.peek_summaries()
+            for card in lx_cards:
+                g = str(card.get("guid") or "")
+                if is_online_guid(g):
+                    # 封面假 id 与 guid 同源：客户端带的是 coverId，需要能反解回歌单
+                    card["coverId"] = "track_" + fake_official_guid(g)
+        except Exception as e:  # noqa: BLE001 - 同步服务故障不能拖垮官方歌单列表
+            logger.warning("lx sync playlist inject failed: %s: %s", type(e).__name__, e)
+            lx_cards = []
+        if lx_cards:
+            lxsync.schedule_prefetch()
     official = [
         it for it in official
         if not (isinstance(it, dict) and (
             dailyrec.is_recommend_playlist_guid(str(it.get("guid") or ""))
             or playlists.is_channel_guid(str(it.get("guid") or ""))
+            or lxsync.is_lxsync_playlist_guid(str(it.get("guid") or ""))
         ))
     ]
-    data["list"] = head + nm_cards + official
+    data["list"] = head + nm_cards + lx_cards + official
     total = data.get("total")
-    data["total"] = (total if isinstance(total, int) else len(official)) + len(head) + len(nm_cards)
+    data["total"] = ((total if isinstance(total, int) else len(official))
+                     + len(head) + len(nm_cards) + len(lx_cards))
     if head:
         # 频道清单在列表页顺带预热（冷却期由 _schedule_playlist_warm 控制）
         _schedule_playlist_warm(
@@ -7976,6 +8045,15 @@ async def playlist_detail(request: Request):
         tracks = nmpl.cached_tracks(nm_pl_id)
         if tracks is not None:
             card = {**card, "trackCount": len(tracks)}
+        return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
+    lx_pid = (lxsync.lxsync_playlist_id_from_guid(guid)
+              or lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(guid)))
+    if lx_pid:
+        # 洛雪同步歌单：只读虚拟歌单，卡片取自内存缓存（trackCount 已在同步时按可播数算好）
+        card = lxsync.card_for(lx_pid)
+        if card is None:
+            return JSONResponse(content={"code": -1, "msg": "playlist not found", "data": None})
+        card["coverId"] = "track_" + fake_official_guid(guid)
         return JSONResponse(content={"code": 0, "msg": "ok", "data": card})
     if playlists.is_channel_guid(guid):
         # W6 频道歌单：从注册表取卡片（createdAt/updatedAt 用注册表 ts，
@@ -8043,7 +8121,13 @@ async def playlist_batch_detail(request: Request):
             for g in guids
         ) if pid
     ]
-    if not recommend_ids and not nm_ids and not channel_ids and not plt_dir_has_data():
+    lx_ids = [
+        pid for pid in (
+            lxsync.lxsync_playlist_id_from_guid(g) or lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(g))
+            for g in guids
+        ) if pid
+    ]
+    if not recommend_ids and not nm_ids and not channel_ids and not lx_ids and not plt_dir_has_data():
         return await forward_to_upstream(request, get_upstream_client(request.app))
 
     upstream_client = get_upstream_client(request.app)
@@ -8052,6 +8136,7 @@ async def playlist_batch_detail(request: Request):
         if not dailyrec.is_recommend_playlist_guid(g)
         and not nmpl.is_nm_playlist_guid(resolve_real_guid(g))
         and not playlists.is_channel_guid(g)
+        and not lxsync.is_lxsync_playlist_guid(resolve_real_guid(g))
     ]
     official_list: list = []
     if rest:
@@ -8116,6 +8201,10 @@ async def playlist_batch_detail(request: Request):
             if tracks is not None:
                 card = {**card, "trackCount": len(tracks)}
             recs.append(card)
+    for pid in lx_ids:
+        card = lxsync.card_for(pid)
+        if card is not None:
+            recs.append(card)
     return JSONResponse(content={"code": 0, "msg": "ok", "data": {"list": recs + official_list}})
 
 
@@ -8137,6 +8226,39 @@ async def playlist_track_list(request: Request):
             return auth_resp
         tracks = dailyrec.stamp_playlist_tracks(
             await nmpl.load_tracks(get_musicbox_client(request.app), nm_pl_id, build_online_track)
+        )
+        _remember_prefetch_context(request, guid, tracks)
+        try:
+            page = max(int(request.query_params.get("page") or 1), 1)
+        except (TypeError, ValueError):
+            page = 1
+        try:
+            size = int(request.query_params.get("size") or 50)
+        except (TypeError, ValueError):
+            size = 50
+        if size == -1:
+            size = max(len(tracks), 1)
+        if size < 1:
+            size = 50
+        start = (page - 1) * size
+        page_tracks = tracks[start:start + size]
+        return JSONResponse(
+            content=disguise_client_json({
+                "code": 0,
+                "msg": "ok",
+                "data": {"list": page_tracks, "total": len(tracks), "sort": request.query_params.get("sort") or ""},
+            })
+        )
+    lx_pid = (lxsync.lxsync_playlist_id_from_guid(guid)
+              or lxsync.lxsync_playlist_id_from_guid(resolve_real_guid(guid)))
+    if lx_pid:
+        # 洛雪同步歌单曲目：整包数据在同步时已拿到（load_tracks 只做 VO 转换，不再打服务端）
+        upstream_client = get_upstream_client(request.app)
+        is_authed, _user_guid, auth_resp = await _probe_upstream_auth(request, upstream_client)
+        if not is_authed and auth_resp is not None:
+            return auth_resp
+        tracks = dailyrec.stamp_playlist_tracks(
+            await lxsync.load_tracks(lx_pid, build_online_track)
         )
         _remember_prefetch_context(request, guid, tracks)
         try:
