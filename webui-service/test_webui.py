@@ -761,10 +761,18 @@ def test_extended_fields_are_split_into_pages_with_slots(env_file):
     assert writeback["choice_labels"]["off"].startswith("只读")
 
 
-def test_app_js_creates_exactly_one_save_row_per_page(env_file):
-    """回归：音源页曾出现两个「保存本页设置」按钮（每个槽位各一个）。"""
+def test_extended_fields_use_the_global_save_bar(env_file):
+    """用户要求：移植过来的设置项也要走底部「有未保存的修改 / 保存并生效」。
+
+    回归背景：曾经每个槽位各挂一个「保存本页设置」按钮，改移植字段不出底部提示条，
+    保存入口也和页面原有设置项分成两套。
+    """
     js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
-    assert js.count("保存本页设置") == 1, "保存按钮只能在 extSaveRow 里创建一次"
+    assert "保存本页设置" not in js, "移植字段不应再有独立的保存按钮"
+    assert 'addEventListener("change", () => markDirty())' in js, "改扩展字段必须点亮底部提示条"
+    save_body = js.split("async function saveConfig()", 1)[1].split("\n}", 1)[0]
+    assert "saveExtendedValues" in save_body, "「保存并生效」必须同时提交扩展字段"
+    assert "/api/extended" in js
     assert "EXT_RAW_SLOTS" in js and "ext-slot-source-account" in js
 
 

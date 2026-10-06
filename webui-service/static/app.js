@@ -193,6 +193,13 @@ async function saveConfig() {
       if (a.kind === "process") parts.push(`进程 ${a.program} ${a.op} ${a.ok ? "成功" : "失败"}`);
       if (a.kind === "lx_activate") parts.push(`洛雪源激活${a.ok ? "成功" : "失败"}`);
     });
+    // 移植过来的设置项（扩展字段）与页面原有设置项共用同一个「保存并生效」
+    try {
+      const extChanged = await saveExtendedValues();
+      if (extChanged) parts.push(`扩展设置 ${extChanged} 项`);
+    } catch (exc) {
+      failed.push({ error: "扩展设置：" + exc.message });
+    }
     if (failed.length) {
       toast((parts.join("；") || "") + ` —— ${failed.map((f) => f.error).join("；")}`, "fail");
     } else {
@@ -626,6 +633,9 @@ function extFieldEl(item) {
   }
   input.dataset.field = item.field;
   input.dataset.kind = item.kind;
+  // 与页面原有设置项统一：一改就点亮底部「有未保存的修改 / 保存并生效」
+  input.addEventListener("input", () => markDirty());
+  input.addEventListener("change", () => markDirty());
   wrap.appendChild(input);
 
   if (item.help) {
@@ -635,21 +645,6 @@ function extFieldEl(item) {
     wrap.appendChild(ht);
   }
   return wrap;
-}
-
-function extSaveRow(onSave) {
-  const row = document.createElement("div");
-  row.className = "row";
-  row.style.marginTop = "10px";
-  const btn = document.createElement("button");
-  btn.className = "btn primary";
-  btn.textContent = "保存本页设置";
-  btn.addEventListener("click", () => void onSave(row));
-  const msg = document.createElement("span");
-  msg.className = "hint";
-  row.appendChild(btn);
-  row.appendChild(msg);
-  return row;
 }
 
 function renderExtended() {
@@ -668,7 +663,7 @@ function renderExtended() {
     if (slot) items.forEach((it) => slot.appendChild(extFieldEl(it)));
   });
 
-  // 2) 页面级槽位：按分组渲染成卡片，并在**每页末尾只放一个**保存按钮
+  // 2) 页面级槽位：按分组渲染成卡片（保存统一走底部「保存并生效」）
   bySlot.forEach((items, id) => {
     if (EXT_RAW_SLOTS.has(id)) return;
     const slot = document.getElementById(id);
@@ -690,7 +685,6 @@ function renderExtended() {
       items.filter((it) => it.group === group).forEach((it) => card.appendChild(extFieldEl(it)));
       slot.appendChild(card);
     });
-    slot.appendChild(extSaveRow(saveExtended));
   });
 }
 
@@ -710,28 +704,20 @@ async function loadExtended(force) {
   }
 }
 
-async function saveExtended(row) {
-  const msg = row ? row.querySelector(".hint") : null;
+async function saveExtendedValues() {
+  // 收集所有移植过来的字段，和页面原有设置项一起被底部「保存并生效」提交。
   const values = {};
   $$("[data-field]").forEach((el) => {
     values[el.dataset.field] = el.dataset.kind === "bool" ? (el.checked ? "true" : "false") : el.value;
   });
-  if (msg) msg.textContent = "保存中…";
-  try {
-    const data = await api("/api/extended", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ values }),
-    });
-    const n = (data.changed || []).length;
-    const text = n ? `已保存 ${n} 项，约 2 秒内生效` : "没有需要保存的改动";
-    if (msg) msg.textContent = text;
-    toast(text);
-    await loadExtended(true);
-  } catch (err) {
-    if (msg) msg.textContent = "保存失败：" + err.message;
-    else toast("保存失败：" + err.message, "err");
-  }
+  if (!Object.keys(values).length) return 0;
+  const data = await api("/api/extended", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ values }),
+  });
+  await loadExtended(true);     // 密钥回掩码、无效值回显后端结果
+  return (data.changed || []).length;
 }
 
 if (document.readyState === "loading") {
