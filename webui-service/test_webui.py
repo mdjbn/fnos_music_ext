@@ -719,10 +719,10 @@ def test_api_requires_admin(env_file):
     assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")
 
 
-# ---------------------------------------------------------------- 扩展设置 ---
+# ------------------------------------------------------- 扩展设置字段表 ---
 
 def test_extended_get_serves_all_console_fields(env_file):
-    """扩展设置页的字段表 = 控制台字段表（同一份 proxy/config_schema.py）。"""
+    """扩展设置字段表 = 控制台字段表（同一份 proxy/config_schema.py）。"""
     from proxy.config_schema import FIELDS
     with authed_client() as client:
         r = client.get("/api/extended")
@@ -812,3 +812,15 @@ def test_extended_put_rejects_bad_values_without_writing(env_file):
     text = env_file.read_text(encoding="utf-8")
     assert "FNMUSIC_LX_SYNC_WRITEBACK" not in text
     assert "FNMUSIC_DAILY_LIMIT" not in text
+
+
+def test_log_page_renamed_and_switches_aligned(env_file):
+    """用户要求：「扩展设置」改名「日志」并删掉那段描述；布尔开关要与旧页开关对齐。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    assert "扩展设置" not in html
+    assert html.count('data-page="extended">日志<') == 2      # 侧栏 + 底部导航
+    assert "<h2>日志</h2>" in html
+    assert 'id="page-extended"' in html
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    assert 'sw.className = "switch-row"' in js, "布尔项必须用 switch-row 排版才会与旧页开关对齐"
+    assert "extGroupOrder" in js, "组顺序要按后端 groups 排（洛雪同步须排在歌单与频道之前）"

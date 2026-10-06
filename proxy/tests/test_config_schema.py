@@ -1,6 +1,6 @@
 """共享配置 schema 的护栏：必须与控制台字段表一一对应，且每种 kind 都能校验。
 
-`proxy/config_schema.py` 是控制台与 A 自带音源页「扩展设置」共用的唯一校验表；
+`proxy/config_schema.py` 是控制台与 A 自带音源页（音乐源/播放与推荐/搜索/边听边存/通知/日志）共用的唯一校验表；
 一旦它和 `admin_ui.CONFIG_FIELDS` 漂移，就会出现「一个页面能存、另一个存不进去」。
 """
 import re
@@ -130,3 +130,7 @@ def test_requested_placements():
         assert page_of[field] == "notify", field
     assert page_of["download_on_favorite"] == "tee"
     assert page_of["download_dir"] == "tee"
+    # 登录态巡检驱动的是 PushPlus 掉线提醒 ⇒ 归到通知页；日志页只剩日志三项
+    assert page_of["login_check_interval_h"] == "notify"
+    assert cs.PAGES["extended"] == "日志"
+    assert [f for f in cs.fields_of_page("extended")] == ["log_max_mb", "log_max_days", "log_quiet"]

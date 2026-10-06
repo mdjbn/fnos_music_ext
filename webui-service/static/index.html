@@ -25,7 +25,7 @@
         <button class="nav-item" data-page="tee">边听边存</button>
         <button class="nav-item" data-page="llm">高级 · 大模型</button>
         <button class="nav-item" data-page="notify">通知</button>
-        <button class="nav-item" data-page="extended">扩展设置</button>
+        <button class="nav-item" data-page="extended">日志</button>
       </nav>
       <div class="sidebar-foot" id="sidebar-foot"></div>
     </aside>
@@ -213,12 +213,9 @@
         </div>
       </section>
 
-      <!-- 扩展设置：完整管理控制台的全部配置项（校验规则由 proxy/config_schema.py 提供） -->
+      <!-- 日志：管理控制台里日志相关的设置项（校验规则由 proxy/config_schema.py 提供） -->
       <section class="page" id="page-extended">
-        <h2>扩展设置</h2>
-        <p class="hint">这里只剩日志与巡检这类杂项。收藏归档在「边听边存」，洛雪歌单同步在「音乐源」，
-          音质/推荐/播放在「播放与推荐」，PushPlus 在「通知」，搜索相关在「搜索」——
-          它们与桌面「管理控制台」共用同一套字段和校验规则，保存后约 2 秒热加载生效。</p>
+        <h2>日志</h2>
         <div id="ext-slot-extended"></div>
       </section>
     </main>
@@ -233,7 +230,7 @@
     <button class="nav-item" data-page="tee">缓存</button>
     <button class="nav-item" data-page="llm">高级</button>
     <button class="nav-item" data-page="notify">通知</button>
-    <button class="nav-item" data-page="extended">扩展</button>
+    <button class="nav-item" data-page="extended">日志</button>
   </nav>
 
   <!-- 保存条 -->

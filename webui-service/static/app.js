@@ -559,6 +559,7 @@ const EXT_SPECIAL_SLOT = {
 };
 const EXT_RAW_SLOTS = new Set(["ext-slot-source-account", "ext-slot-quality-levels"]);
 let extFields = [];
+let extGroupOrder = [];
 
 function extSlotOf(item) {
   return EXT_SPECIAL_SLOT[item.field] || ("ext-slot-" + (item.page || "extended"));
@@ -576,12 +577,30 @@ function extFieldEl(item) {
   cap.textContent = item.label || item.field;
   wrap.appendChild(cap);
 
-  let input;
   if (item.kind === "bool") {
-    input = document.createElement("input");
-    input.type = "checkbox";
-    input.checked = String(item.value) === "true";
-  } else if (item.kind === "choices" && (item.choices || []).length) {
+    // 与旧页自带的开关同款排版：标题+说明在左、勾选框右对齐，两者才会对齐
+    const sw = document.createElement("label");
+    sw.className = "switch-row";
+    const body = document.createElement("span");
+    body.textContent = item.label || item.field;
+    if (item.help) {
+      const sub = document.createElement("div");
+      sub.className = "sub";
+      sub.innerHTML = item.help;
+      body.appendChild(sub);
+    }
+    sw.appendChild(body);
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = String(item.value) === "true";
+    box.dataset.field = item.field;
+    box.dataset.kind = "bool";
+    sw.appendChild(box);
+    return sw;
+  }
+
+  let input;
+  if (item.kind === "choices" && (item.choices || []).length) {
     input = document.createElement("select");
     input.className = "input";
     item.choices.forEach((c) => {
@@ -656,6 +675,11 @@ function renderExtended() {
     if (!slot) return;
     const groups = [];
     items.forEach((it) => { if (!groups.includes(it.group)) groups.push(it.group); });
+    groups.sort((a, b) => {
+      const ia = extGroupOrder.indexOf(a);
+      const ib = extGroupOrder.indexOf(b);
+      return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+    });
     groups.forEach((group) => {
       const card = document.createElement("div");
       card.className = "card";
@@ -678,6 +702,7 @@ async function loadExtended(force) {
   try {
     const data = await api("/api/extended");
     extFields = data.fields || [];
+    extGroupOrder = data.groups || [];
     renderExtended();
   } catch (err) {
     const slot = document.getElementById("ext-slot-extended");

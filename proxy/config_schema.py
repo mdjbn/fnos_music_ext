@@ -272,15 +272,15 @@ def coerce(field: str, raw: Any) -> str:
 #   quality  播放与推荐（音质 / 推荐 / 播放 / 本地曲库）
 #   search   搜索
 #   tee      边听边存（收藏归档）
-#   notify   通知（PushPlus）
-#   extended 扩展设置（日志与巡检，剩下的都在这）
+#   notify   通知（PushPlus + 登录态巡检）
+#   extended 日志（日志上限/保留/降噪）
 PAGES: dict[str, str] = {
     "source": "音乐源",
     "quality": "播放与推荐",
     "search": "搜索",
     "tee": "边听边存",
     "notify": "通知",
-    "extended": "扩展设置",
+    "extended": "日志",
 }
 
 _QUALITY_ZH = {"standard": "标准 128k", "higher": "较高 192k", "exhigh": "极高 320k",
@@ -384,27 +384,28 @@ FIELD_UI: dict[str, dict] = {
     "download_on_favorite": {"page": "tee", "group": "收藏归档", "label": "点收藏时自动下载",
                              "help": "取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词"},
     # ---- 通知 ----
-    "pushplus_enabled": {"page": "notify", "group": "PushPlus 推送", "label": "启用 PushPlus 推送提醒",
+    "pushplus_enabled": {"page": "notify", "group": "推送与巡检", "label": "启用 PushPlus 推送提醒",
                          "help": "登录失效 / 首次未登录 / 登录成功 / VIP 临期时推送到微信"},
-    "pushplus_token": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus token",
+    "pushplus_token": {"page": "notify", "group": "推送与巡检", "label": "PushPlus token",
                        "help": "到 pushplus.plus 个人中心复制；该服务需实名认证，否则收不到推送。"
                                "<b>留空 = 保持原值</b>"},
-    "pushplus_topic": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus 群组编码",
+    "pushplus_topic": {"page": "notify", "group": "推送与巡检", "label": "PushPlus 群组编码",
                        "help": "填了就推送到该群组（一对多）"},
-    "pushplus_template": {"page": "notify", "group": "PushPlus 推送", "label": "消息模板",
+    "pushplus_template": {"page": "notify", "group": "推送与巡检", "label": "消息模板",
                           "help": "PushPlus 支持的消息格式",
                           "choice_labels": {"markdown": "Markdown（推荐）", "html": "HTML",
                                             "txt": "纯文本", "json": "JSON"}},
-    "pushplus_url": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus 接口地址",
+    "pushplus_url": {"page": "notify", "group": "推送与巡检", "label": "PushPlus 接口地址",
                      "help": "一般不用改，除非你自建了转发"},
     # ---- 扩展设置（剩下的）----
-    "login_check_interval_h": {"page": "extended", "group": "日志与巡检", "label": "登录态巡检间隔（小时）",
-                               "help": "0 表示只在请求时按需探测"},
-    "log_max_mb": {"page": "extended", "group": "日志与巡检", "label": "单个日志文件上限（MB）",
+    "login_check_interval_h": {"page": "notify", "group": "推送与巡检", "label": "登录态巡检间隔（小时）",
+                               "help": "每隔多久检查一次网易云登录态（掉线/VIP 临期会推 PushPlus）。"
+                                       "0 表示只在有请求时按需探测"},
+    "log_max_mb": {"page": "extended", "group": "日志", "label": "单个日志文件上限（MB）",
                    "help": "超过即就地截断保留最近一半，0 表示不限制"},
-    "log_max_days": {"page": "extended", "group": "日志与巡检", "label": "日志保留天数",
+    "log_max_days": {"page": "extended", "group": "日志", "label": "日志保留天数",
                      "help": "超期的备份日志直接删除、超期的活跃日志清空，0 表示永久保留"},
-    "log_quiet": {"page": "extended", "group": "日志与巡检", "label": "日志降噪",
+    "log_quiet": {"page": "extended", "group": "日志", "label": "日志降噪",
                   "help": "默认开：不记封面、5 秒保活心跳、客户端状态轮询这类高频访问行。"
                           "排障时可关掉看完整原始日志（代价是日志涨得快）"},
 }
@@ -418,7 +419,7 @@ for _field, _ui in FIELD_UI.items():
 GROUP_ORDER = [
     "洛雪歌单同步", "网易账号歌单", "歌单与频道",
     "音质", "推荐", "播放", "本地曲库",
-    "搜索", "收藏归档", "PushPlus 推送", "日志与巡检",
+    "搜索", "收藏归档", "推送与巡检", "日志",
 ]
 
 
