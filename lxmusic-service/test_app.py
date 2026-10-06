@@ -429,16 +429,21 @@ def test_track_url_music_info_carries_platform_keys(isolated):
 # ------------------------------------------------------------------ 熔断 ---
 
 def test_circuit_opens_after_consecutive_failures(isolated):
+    """连续 3 首**不同**曲目解析失败 → 打开熔断（第 4 次起跳过）。
+
+    W14 起失败按曲去重：同一首歌反复重试（含逐档降级、以及 proxy 侧逐档再请求）只算
+    一次失败，见 `test_lx_reliability.py::test_same_track_retries_count_once`。
+    """
     rt = FakeRuntime(resolver=SourceError("resolve", "boom"))
     isolated._runtime = rt
 
     async def run():
         http = mock_client(lambda r: httpx.Response(404))
         try:
-            for _ in range(5):
+            for n in range(5):
                 try:
                     await lxapp.resolve_and_probe(
-                        http, "kw", {"id": "lx:kw:1", "title": "t", "duration_s": 200}
+                        http, "kw", {"id": f"lx:kw:{n}", "title": "t", "duration_s": 200}
                     )
                 except lxapp.ChainTransportError:
                     pass

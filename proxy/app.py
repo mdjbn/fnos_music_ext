@@ -2468,6 +2468,15 @@ async def _lx_search_request(client: httpx.AsyncClient, keyword: str, limit: int
 # lx = 洛雪源脚本三档（128k/320k/flac 对应 standard/high/lossless）
 _NETEASE_QUALITY_LADDER = ["standard", "higher", "exhigh", "lossless", "hires", "jymaster"]
 _LX_QUALITY_LADDER = ["standard", "high", "lossless"]
+# W14：lx 的解析发生在 lxmusic-service 进程内（用户源脚本跑搜索 + 取直链），冷启动实测
+# 3–16s，与服务端单档 resolver 超时（12s）同量级；musicbox 那条「毫秒级取链」的 6s
+# 预算掐不住它。HEAD 不再解析后这里成了唯一解析点，给 lx 用满 GET 的总预算。
+LX_RESOLVE_BUDGET_S = 12.0
+
+
+def online_resolve_budget(guid: str) -> float:
+    """单次直链解析预算：lx 的慢在用户源脚本（3–16s），musicbox 取链是毫秒级。"""
+    return LX_RESOLVE_BUDGET_S if source_from_online_guid(guid) == "lx" else 6.0
 
 
 def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", primary: "str | None" = None) -> list[str]:
@@ -2493,6 +2502,47 @@ def quality_order(ladder: "list[str] | tuple[str, ...]", mode: "str | None", pri
     return [seq[idx]] + list(reversed(seq[:idx]))
 
 
+# W14：lx 直链解析失败留痕。旧实现只认 HTTP 200，非 200（404/502）与 `ok:false`
+# 被静默跳过，journal 里只剩播放器那句 404，排障无从下手（真实事故：用户源熔断后
+# 所有曲目 0.07s 失败，日志里看不到 `user source circuit open` / `播放地址解析失败`）。
+# 按 (song, 档位, 原因) 去重 60s：整轨多档重试不刷屏。
+_LX_FAIL_LOG: dict[tuple[str, str], float] = {}
+_LX_FAIL_LOG_WINDOW_S = 60.0
+
+
+def _lx_error_text(payload, status: int) -> str:
+    """从 lxmusic-service 响应里抽出可读原因（含熔断/无直链等分类串）。"""
+    data = payload
+    if hasattr(payload, "json"):
+        try:
+            data = payload.json()
+        except Exception:
+            data = None
+    detail = ""
+    if isinstance(data, dict):
+        inner = data.get("data")
+        detail = str(data.get("error") or "").strip()
+        if not detail and isinstance(inner, dict):
+            detail = str(inner.get("error") or "").strip()
+        if not detail:
+            detail = "empty url" if data.get("ok") is not False else "ok=false"
+    return f"http={status} {detail}".strip()
+
+
+def _log_lx_resolve_failure(song_id: str, quality: str, detail: str) -> None:
+    key = (song_id, f"{quality}|{detail}")
+    now = time.monotonic()
+    last = _LX_FAIL_LOG.get(key)
+    if last is not None and now - last < _LX_FAIL_LOG_WINDOW_S:
+        return
+    if len(_LX_FAIL_LOG) > 256:
+        for k, ts in list(_LX_FAIL_LOG.items()):
+            if now - ts >= _LX_FAIL_LOG_WINDOW_S:
+                _LX_FAIL_LOG.pop(k, None)
+    _LX_FAIL_LOG[key] = now
+    logger.warning("lx 直链解析失败 song=%s quality=%s %s", song_id, quality, detail)
+
+
 async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | None":
     """洛雪音乐源直链解析：song_id 形如 "lx:kg:<hash>"。"""
     primary = str(CONF.get("lx_quality") or "lossless").strip()
@@ -2500,6 +2550,7 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
     if primary and primary not in qualities:
         qualities.insert(0, primary)
 
+    last = ""
     for q in qualities:
         try:
             r = await client.get(
@@ -2515,8 +2566,13 @@ async def resolve_lx_url(client: httpx.AsyncClient, song_id: str) -> "dict | Non
                     inner = data.get("data")
                     if isinstance(inner, dict) and inner.get("url"):
                         return inner
+            last = _lx_error_text(r, r.status_code)
+            _log_lx_resolve_failure(song_id, q, last)
         except Exception as e:
+            last = f"{type(e).__name__}: {e}"
             logger.warning("resolve_lx_url error for %s (quality=%s): %s", song_id, q, e)
+    if last:
+        _log_lx_resolve_failure(song_id, "all", last)
     return None
 
 
@@ -5563,7 +5619,14 @@ def _maybe_retry_official_binds(request: Request, user_guid: str,
 
 
 async def _stream_head_response(request: Request, guid: str, cached: str | None, range_header: str | None) -> Response:
-    """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源轻量试开一次即关。"""
+    """HEAD 探测（部分手机播放器先 HEAD 后 GET）：缓存命中回真实大小头；在线源只做门控，不再解析直链。
+
+    W14：未命中缓存时**不再试开直链**。旧实现给 `_open_online_stream` 4s 死线，而 lxmusic
+    单次解析预算 12s、端点总预算 20s（野生用户源实测 3–16s），超时一律 404 ⇒ 播放器判定
+    「不可播」直接下一曲（同一首歌时好时坏：解析成功过一次被 lx 服务缓存 1800s 后才秒开）。
+    现在 HEAD 只做「源是否启用」这项廉价判断，直链解析交给随后 GET 的 12s 预算；回 200
+    但不带 content-length（不谎报长度），仍声明 `Accept-Ranges: bytes` 以支持拖动。
+    """
     if cached:
         ext = os.path.splitext(cached)[1].lstrip(".") or "mp3"
         full = serve_file_with_range(cached, range_header, media_type_for_ext(ext))
@@ -5572,24 +5635,12 @@ async def _stream_head_response(request: Request, guid: str, cached: str | None,
         # 与 GET 路径同一门控：源未启用/平台被过滤时立刻 404，不再对着停掉的服务
         # 逐个音质白等（实测 HEAD 探针每轨 3×22s，播放器表现为一直转圈/跳下一曲）。
         return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
-    opened = None
-    try:
-        opened = await asyncio.wait_for(_open_online_stream(request, guid, range_header), timeout=4.0)
-    except Exception:
-        opened = None
-    if not opened:
-        return JSONResponse(content={"code": 404, "msg": "online source unavailable", "data": None}, status_code=404)
-    resp, owned, _ext, _info, _chunks, _first = opened
-    headers = {"Accept-Ranges": "bytes", "Cache-Control": "no-store"}
-    for key in ("content-type", "content-length", "content-range"):
-        val = resp.headers.get(key)
-        if val:
-            headers[key] = val
-    with anyio.CancelScope(shield=True):
-        await resp.aclose()
-        if owned:
-            await owned.aclose()
-    return Response(status_code=206 if "content-range" in headers else 200, headers=headers)
+    resp = Response(status_code=200, headers={"Accept-Ranges": "bytes", "Cache-Control": "no-store"})
+    # Starlette 会给无 body 的 Response 补 `content-length: 0`——对 HEAD 探测等于告诉
+    # 播放器「这首歌是空的」。必须去掉：长度未知就不报长度，真实长度由随后的 GET 决定。
+    if "content-length" in resp.headers:
+        del resp.headers["content-length"]
+    return resp
 
 
 def _candidate_kbps(item: dict) -> float:
@@ -5859,13 +5910,17 @@ async def stream_track(request: Request, subpath: str = ""):
     for candidate in list(dict.fromkeys(candidates))[:3]:
         if not _source_enabled(candidate):
             continue
+        # W14：lx 的解析慢在用户源脚本（3–16s），沿用 musicbox 的 6s 单次预算会把
+        # 「能放但慢」的曲子掐断成 404（HEAD 不解析后这条路径是唯一解析点）。总预算
+        # 仍是 12s，只是对 lx 不再切成两段 6s。
+        per_try = online_resolve_budget(candidate)
         for attempt in range(2):
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 break
             try:
                 # 单次解析预算与 musicbox-service 进程内取链（毫秒级）+ 网络抖动余量对齐
-                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(6.0, remaining))
+                opened = await asyncio.wait_for(_open_online_stream(request, candidate, range_header), timeout=min(per_try, remaining))
             except Exception as exc:
                 logger.warning("Stream startup failed for %s: %s", candidate, type(exc).__name__)
                 opened = None

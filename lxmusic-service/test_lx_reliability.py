@@ -185,3 +185,74 @@ def test_resolve_and_probe_skips_trial_items(isolated):
 
     assert asyncio.run(run()) is None
     assert rt.calls == []
+
+
+# ===========================================================================
+# W14：熔断按曲去重（失败不按档位重复计数）
+#
+# 真实事故：一手故障曲在端点内部走 lossless→high→standard 三档，proxy 侧还会按音质
+# 模式再逐档发一次 ⇒ 一首歌就被计成 3+ 次失败，直接打开 600s 熔断，之后**所有**曲目
+# 0.07s 返回 `user source circuit open`（用户看到"成片跳曲"）。
+# ===========================================================================
+
+
+def test_same_track_retries_count_once(isolated):
+    """同一首歌逐档/重复请求只算一次失败：不得因一首故障曲熔断整源。"""
+    isolated._runtime = FakeRuntime(resolver=SourceError("resolve", "script exploded"))
+
+    async def run():
+        http = mock_client(lambda r: httpx.Response(404))
+        try:
+            for _ in range(3):  # proxy 会按音质档位重复请求同一首
+                try:
+                    await lxapp.resolve_and_probe(http, "kw", dict(_ITEM), "lossless")
+                except lxapp.ChainTransportError:
+                    pass
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    snap = lxapp.chain_health_snapshot()
+    assert snap["user_source"]["open"] is False
+    assert snap["user_source"]["fails"] == 1
+
+
+def test_distinct_tracks_still_open_circuit(isolated):
+    """去重不能掩盖真实故障：三首不同的曲目各自失败仍要熔断。"""
+    isolated._runtime = FakeRuntime(resolver=SourceError("resolve", "script exploded"))
+
+    async def run():
+        http = mock_client(lambda r: httpx.Response(404))
+        try:
+            for n in range(3):
+                try:
+                    await lxapp.resolve_and_probe(http, "kw", dict(_ITEM, id=f"lx:kw:{1000 + n}"), "lossless")
+                except lxapp.ChainTransportError:
+                    pass
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert lxapp.chain_health_snapshot()["user_source"]["open"] is True
+
+
+def test_same_track_failure_counts_again_after_window(isolated):
+    """窗口过期后同一首歌的失败重新计数（否则故障源会被永久豁免）。"""
+    lxapp._chain_report("user_source", False, key="kw:228908")
+    assert lxapp.chain_health_snapshot()["user_source"]["fails"] == 1
+    # 模拟 60s 前的失败记录
+    lxapp._CHAIN_HEALTH["user_source"]["fail_ts"] = time.time() - (lxapp._CHAIN_FAIL_DEDUPE_SECONDS + 1)
+    lxapp._chain_report("user_source", False, key="kw:228908")
+    assert lxapp.chain_health_snapshot()["user_source"]["fails"] == 2
+
+
+def test_half_open_probe_failure_always_counts():
+    """half-open 试探失败必须计数续期，不能被去重吃掉。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + 600, "breaks": 0,
+        "half_open": True, "fail_key": "kw:228908", "fail_ts": time.time(),
+    }
+    lxapp._chain_report("user_source", False, key="kw:228908")
+    snap = lxapp.chain_health_snapshot()
+    assert snap["user_source"]["breaks"] == 1
+    assert snap["user_source"]["state"] == "open"

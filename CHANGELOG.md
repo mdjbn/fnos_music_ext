@@ -11,6 +11,14 @@
 - **项目元信息改指向本仓库**：fpk 的开发者/发布者信息（`packaging/fpk/manifest.in` 的 `maintainer`/`maintainer_url`）、老控制台页脚「项目主页」、README 与 `docs/INSTALL.md` 的克隆地址与 Releases 链接，统一指向 `https://github.com/mdjbn/fnos_music_ext`；GitHub Actions 的 Gitee 发行版同步改由仓库变量 `GITEE_REPO` 控制（未配置时整步跳过）。
 - **文档与注释示例去个人化**：授权目录示例统一改为通用占位（`/vol1/1000/<共享空间名>/<音乐目录名>`）。
 
+### 修复
+
+- **洛雪音源「同一首歌时好时坏、常常直接下一曲」三处根因修复**（用户报障：日志中失败的 HEAD 探测恰好 4.0 秒后 404，成功的 0.1–0.9 秒）：
+  1. **HEAD 探测不再解析直链**：播放器每首先 `HEAD /music/api/v1/track/stream` 探活，而旧实现只给 `_open_online_stream` **4 秒**死线，洛雪服务单档解析预算却是 12s、端点总预算 20s（野生用户源实测 3–16s），超时一律回 404 ⇒ 播放器判定「不可播」直接下一曲；解析成功过一次会被洛雪服务缓存（`LX_CACHE_TTL=1800`）后秒开，于是「同一首歌时好时坏」。现 HEAD 只保留「源是否启用」这一项廉价门控，未命中缓存立刻回 200（不谎报 `content-length`、仍声明 `Accept-Ranges: bytes`），直链解析交给随后 GET 的 12s 预算（该路径原本沿用 musicbox「毫秒级取链」的 6s 单次预算，对洛雪用户源脚本仍偏紧，现按源放宽：洛雪用满 12s，网易云仍为 6s）；本地缓存命中照旧回真实大小。
+  2. **熔断器按曲去重（失败不再按档位重复计数）**：洛雪服务端点内部按 `lossless→high→standard` 逐档降级，代理侧还会按音质模式再逐档发一次，一首故障曲极易被计成 3+ 次失败 ⇒ 直接打开 600s 熔断，之后**所有**曲目 0.07s 返回 `user source circuit open`（表现为「成片跳曲」）。现 `_chain_report` 带曲目标识，同一首歌 60s 窗口内只计一次失败（half-open 试探失败仍计数续期，不同曲目照常累计到阈值熔断）。
+  3. **解析失败留痕**：`resolve_lx_url` 此前只认 HTTP 200，非 200（404/502）与 `ok:false` 被静默跳过，journal 里只剩播放器那句 404，看不到 `user source circuit open` / `播放地址解析失败`。现按 (歌曲, 档位, 原因) 去重 60s 记 warning，全部档位失败再补一条汇总。
+- 回归测试：新增 `proxy/tests/test_lx_playback_stability.py`（HEAD 不解析、缓存仍报真实大小、门控仍 404、原因留痕与去重、按源解析预算 5 例）与 `lxmusic-service/test_lx_reliability.py` 4 例熔断去重回归（同曲重试只计一次、不同曲目仍熔断、窗口过期重新计数、half-open 失败必计）。
+
 ## [2.6.3] - 2026-09-30
 
 ### 修复

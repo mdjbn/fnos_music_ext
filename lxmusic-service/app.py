@@ -617,6 +617,10 @@ _CHAIN_OPEN_SECONDS = 600
 # 会让搜索探活连续失败触发熔断，若只能干等 10 分钟冷却，用户看到的就是"搜索全空"。
 # 真实事故：换到健康源后熔断仍卡在 open，所有平台被 source_circuit_open 拦截。
 _CHAIN_RETRY_SECONDS = 30
+# 同一首歌的重复失败不重复计数：端点内部 lossless→high→standard 逐档降级，proxy 侧
+# 还会按音质模式再逐档发一次，一首故障曲很容易被计成 3+ 次失败 ⇒ 直接打开 600s 熔断，
+# 之后**所有**曲目 0.07s 返回 `user source circuit open`（用户看到"成片跳曲"）。
+_CHAIN_FAIL_DEDUPE_SECONDS = 60.0
 _CHAIN_HEALTH: dict[str, dict] = {}
 
 
@@ -643,16 +647,28 @@ def _chain_acquire(name: str) -> bool:
     return True
 
 
-def _chain_report(name: str, ok: bool) -> None:
+def _chain_report(name: str, ok: bool, key: str = "") -> None:
+    """记账一次链路结果。key = 曲目标识：同一首歌在窗口内只计一次失败。
+
+    half-open 试探失败仍必须计数（`was_half_open` 跳过去重），否则熔断窗口无法续期。
+    """
     h = _CHAIN_HEALTH.setdefault(name, {"fails": 0, "open_until": 0.0, "breaks": 0})
     was_half_open = h.pop("half_open", False)
     if ok:
         h["fails"] = 0
         h["open_until"] = 0.0
+        h.pop("fail_key", None)
+        h.pop("fail_ts", None)
         return
+    now = time.time()
+    if (not was_half_open and key and h.get("fail_key") == key
+            and now - float(h.get("fail_ts") or 0) < _CHAIN_FAIL_DEDUPE_SECONDS):
+        return
+    h["fail_key"] = key
+    h["fail_ts"] = now
     h["fails"] = int(h.get("fails") or 0) + 1
     if was_half_open or h["fails"] >= _CHAIN_FAIL_THRESHOLD:
-        h["open_until"] = time.time() + _CHAIN_OPEN_SECONDS
+        h["open_until"] = now + _CHAIN_OPEN_SECONDS
         h["fails"] = 0
         h["breaks"] = int(h.get("breaks") or 0) + 1
 
@@ -841,7 +857,8 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
             raise
         except Exception as exc:  # transport, timeout, or script rejection
             _record_failure(exc)
-            _chain_report("user_source", False)
+            # 按曲去重：同一首歌换档位重试（以及 proxy 侧再逐档发一次）只算一次失败
+            _chain_report("user_source", False, key=f"{src}:{identifier}")
         else:
             # A clean resolve without usable media is not a source outage.
             # A late pre-open request must not close a circuit opened by siblings.
