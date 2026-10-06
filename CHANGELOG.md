@@ -5,6 +5,12 @@
 
 ## [Unreleased]
 
+### 变更
+
+- **开源准备：README 新增「与原版的区别」**：逐项说明本仓库相对上游 `javycoder/fnos_music_ext` v2.6.3 的增量——新增功能（频道歌单、网易账号歌单、洛雪歌单同步、本地曲库优先、动态音质与下一首预热、PushPlus 与日志保留、统一配置 schema 等）、修复与行为差异（网易云容器按字节嗅探、洛雪 CDN UA、账户与频道歌单总闸、跨音源保活、写操作默认关、控制台保存 500、key 与别名对齐），以及未并入另一分支的部分（本地每日推荐未实现）。
+- **项目元信息改指向本仓库**：fpk 的开发者/发布者信息（`packaging/fpk/manifest.in` 的 `maintainer`/`maintainer_url`）、老控制台页脚「项目主页」、README 与 `docs/INSTALL.md` 的克隆地址与 Releases 链接，统一指向 `https://github.com/mdjbn/fnos_music_ext`；GitHub Actions 的 Gitee 发行版同步改由仓库变量 `GITEE_REPO` 控制（未配置时整步跳过）。
+- **文档与注释示例去个人化**：授权目录示例统一改为通用占位（`/vol1/1000/<共享空间名>/<音乐目录名>`）。
+
 ## [2.6.3] - 2026-09-30
 
 ### 修复

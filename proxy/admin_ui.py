@@ -1916,7 +1916,7 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 
   <div class="sub" style="text-align:center;margin-top:20px">
     fnmusic-ext · 音源仅来自你登录的私人网易云账号 ·
-    <a href="https://github.com/gzywd/fnos_music_ext" style="color:var(--acc)">项目主页</a>
+    <a href="https://github.com/mdjbn/fnos_music_ext/tree/main" style="color:var(--acc)">项目主页</a>
   </div>
 </div>
 

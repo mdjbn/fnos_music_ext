@@ -1,10 +1,13 @@
 # fnmusic-ext 飞牛音乐扩展代理
 
-Gitee：https://gitee.com/javycoder/fnos_music_ext
+仓库地址：https://github.com/mdjbn/fnos_music_ext
 
-GitHub：https://github.com/javycoder/fnos_music_ext
+[![CI](https://github.com/mdjbn/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/mdjbn/fnos_music_ext/actions/workflows/ci.yml)
 
-[![CI](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml/badge.svg?branch=dev)](https://github.com/javycoder/fnos_music_ext/actions/workflows/ci.yml)
+> **这是一个社区增强分支。** 本仓库以 [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) **v2.6.3** 为基线，
+> 整合了 [gzywd/fnos_music_ext](https://github.com/gzywd/fnos_music_ext) 的独有功能，并持续修复播放/歌单问题。
+> 上游的部署形态（systemd 接管官方 Socket、单容器音源、三音源互斥）与安装方式完全不变，本仓库只做加法。
+> 与上游的逐项差异见「[与原版的区别](#与原版的区别)」。上游项目与相关开源组件的版权与致谢见文末。
 
 `fnmusic-ext` 是专为 fnOS（飞牛私有云）自带音乐应用（`trim.music`）打造的**无侵入增强扩展**。它通过接管官方后端的 Unix Socket 通信入口，在完全不修改官方程序、nginx 配置与数据库的前提下，让原生飞牛音乐获得在线音乐能力；可随时一条命令还原官方直连。
 
@@ -24,7 +27,50 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 - **自动下载歌词**（v2.6.0 起，默认关）：自动保存到本地曲库的歌曲在完整下载成功后，自动下载同名 `.lrc` 歌词放到歌曲同一个文件夹，官方 App 扫描入库后播放即显示歌词；下载失败不产生歌词文件（可在 WebUI 开启）；
 - **推荐体系**：「热门推荐」与「每日推荐 MM-DD」两个独立歌单、独立开关；默认采信音源原生推荐，未启用网易时可配 OpenAI 兼容大模型兜底；歌单封面取列表里第一首有封面的曲目；
 - **网易账号歌单**（v2.6.0 起，默认关）：网易盒子扫码登录后，账号里自己创建的歌单以只读歌单出现在音乐页「热门推荐」下方、官方歌单上方，点开即听（曲目经可播过滤）；在音乐页加歌/移歌/删除不回写网易；
-- **多用户隔离收藏**：家庭多成员的红心收藏彼此独立，与本地曲库融合。
+- **多用户隔离收藏**：家庭多成员的红心收藏彼此独立，与本地曲库融合；
+- **频道歌单**（默认关）：排行榜、分类歌单、新碟上架、推荐歌单、私人FM 以虚拟歌单注入音乐页；设独立总闸，避免「什么都没开却凭空多出十几张榜单」；
+- **洛雪歌单同步**（默认关）：连接你自建的 lx-music-sync-server，把里面的歌单与试听列表以只读歌单同步进音乐页（可选回写，默认关）；
+- **本地曲库优先**：在线曲目先在本地曲库里找同一首，命中且音质档位符合策略就直接读本地文件，省掉一次取直链 + CDN 下载；
+- **动态音质与下一首预热**：按飞牛的音质偏好与当前网络类型决定向音源要哪一档；播放当前曲目时提前把下一首的直链与元数据取回来，切歌更快。
+
+> 以上是本仓库相对上游的**增量**。逐项差异（新增功能、修复、未并入的部分）见下一节。
+
+## 与原版的区别
+
+本仓库（`mdjbn/fnos_music_ext`）以 [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext) **v2.6.3**
+（上游提交 `ec90c42`）为基线，整合了 [gzywd/fnos_music_ext](https://github.com/gzywd/fnos_music_ext) **v2.9.30** 的独有功能，
+并在其之上继续修复与打磨。相对上游的规模：**68 个文件、约 +24900 行**（含测试）。
+
+### 新增功能
+
+| 方向 | 新增内容 |
+| :--- | :--- |
+| **歌单体系** | 频道歌单（排行榜/分类/新碟上架/推荐歌单/私人FM，独立总闸默认关）；网易账号歌单（扫码后只读注入，独立总闸）；洛雪音乐同步服务器歌单（只读注入 + 试听列表，可选回写，默认关）；歌单缓存 + 每日定时预热；频道歌单的展示顺序与手动排序、每类数量上限 |
+| **本地能力** | 本地曲库优先播放（`/_ext/localfirst`）：在线曲目命中本地文件且音质达标时直读；飞牛「授权目录」网关客户端（按飞牛规范申请 ACL，取代以 root 直接硬读用户目录）；本地曲库文件索引与标签/内嵌封面读取 |
+| **播放体验** | 动态音质策略（按飞牛音质偏好 + 网络类型选档）；下一首预热（提前取直链与元数据）；收藏即归档（按歌手建子目录、落盘账号可得的最高品质 + 同名 `.lrc`，默认关） |
+| **通知与运维** | PushPlus 掉线/登录态失效提醒；日志保留策略（单文件就地截断 + 过期清理，兼容 `O_APPEND` 写入端）；管理界面独立进程 + 崩溃守护 + 一键重启脚本；桌面图标直达完整管理控制台 |
+| **配置面** | `proxy/config_schema.py` 统一配置 schema（旧音源页「扩展设置」与控制台共用一份校验表，避免两处规则漂移）；旧音源页「扩展设置」按页拆分、全中文；两套前端统一走底部「有未保存的修改 / 保存并生效」 |
+
+### 修复与行为差异
+
+- **网易云「一直转圈」**：上游按 CDN 返回的 `Content-Type` 决定容器类型，而 CDN 对 FLAC 也回 `audio/mpeg`，于是每首无损都被当成 MP3（按 MIME 选解码器的播放器永远解不出帧）。现在以**响应首字节**判定真实容器（`fLaC`/`OggS`/`MAC `/`wvpk`/`DSD `/`FRM8`/`ftyp`/`RIFF`/`ID3`…），HLS 分片的 MIME（`init.mp4`、`.m4s`）一并修正；
+- **洛雪音源「自动下一曲」**：中文 CDN 按 UA 反爬，默认 UA 直链返回 403、响应体 0 字节，播放器拿不到数据就跳下一首。现在所有直链请求（含 ffmpeg 的远程输入）统一带浏览器 UA；
+- **账户歌单总闸**：关掉「音乐页显示网易账号歌单」后，频道歌单里勾选的「我的歌单」不会再注入（否则会出现「取消勾选却还在显示」）；
+- **频道歌单总闸**：新增独立开关（默认关）。榜单/分类/新碟是**公开口径、不需要登录**，不设总闸时即使账号歌单与洛雪歌单都关着，音乐页也会凭空多出十几张「榜｜…」「华语｜…」；
+- **跨音源组合**：洛雪歌单里的网易云（wy）曲目借网易云链路播放；选洛雪/网盘音源时打开账号歌单或频道歌单开关，会让「网易云音乐盒子」作为**附加音源常驻**（代价是多一份内存，两个开关都关掉即回收）；
+- **默认值收紧**：收藏自动下载、红心写回、洛雪歌单回写等**对账号的写操作**一律默认关闭，需显式打开；
+- **控制台保存报 HTTP 500**：移植来的配置项校验器引用了没一起搬走的模块级常量；现在改为可读的 400 错误，并有测试保证「每个字段的默认值都能过校验器」；
+- **文案与键名对齐**：频道歌单顺序的说明改用真实 key（`mine`/`nrec`/`toplist`/`category`/`newalbum`/`fm`），同时兼容旧别名（`hot`/`my`/`newalbums`/`radio`）。
+
+### 未并入上游另一分支的部分
+
+`gzywd` 分支中面向其单源架构的纯诊断路由（`/_ext/localdaily`、`/_ext/failures`、`/_ext/hls|playstart|streammode`）未并入本仓库；
+相关的 `FNMUSIC_LOCAL_DAILY_*` 等开关在界面上隐藏（**本地每日推荐功能未实现**）。本地曲库文件索引模块已并入，当前只服务于本地曲库/本地优先播放。
+
+### 测试
+
+相对上游新增约 30 个测试模块（歌单注入与缓存、授权网关、预取、音质策略、洛雪协议与同步、管理界面、配置 schema、媒体容器嗅探等）。
+`proxy/tests`、`musicbox-service`、`webui-service` 可分别单跑，CI 会跑全量。
 
 ## 架构
 
@@ -64,7 +110,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ### 安装（推荐：应用中心 fpk 包）
 
-从 [GitHub Releases](https://github.com/javycoder/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
+从 [GitHub Releases](https://github.com/mdjbn/fnos_music_ext/releases) 下载最新 `fnmusic-ext-<版本>.fpk`，在 fnOS「应用中心 → 手动安装」选择该文件，按向导选择**初始音源**即可自动完成安装并启用。
 
 - 桌面会出现「fnMusic 扩展管理」图标，点击即在飞牛桌面窗口内打开管理页（音源切换/扫码登录/平台选择/洛雪源配置）；
 - 选洛雪音源时向导不索要任何源信息：装好后打开管理页，在「音乐源 → 洛雪自定义源」里粘贴脚本 URL、上传电脑 `.js` 文件或从 NAS 选择，测试可用后保存即激活；
@@ -80,7 +126,7 @@ GitHub：https://github.com/javycoder/fnos_music_ext
 
 ```bash
 sudo apt-get update && sudo apt-get install -y python3 python3-venv git
-git clone https://github.com/javycoder/fnos_music_ext.git fnmusic_ext
+git clone https://github.com/mdjbn/fnos_music_ext.git fnmusic_ext
 cd fnmusic_ext
 chmod +x install.sh extend.sh restore.sh proxy/run_proxy.sh
 ./install.sh
@@ -210,4 +256,5 @@ sudo python3 tests/integration/fpk_lifecycle.py --auto-restore
 - 洛雪自定义源脚本等第三方代码由使用者自行提供并在容器内执行。导入 URL 或 `.js` 前必须自行确认来源安全，不要导入来历不明的脚本，且仅访问您有权收听的内容；
 - 使用者应遵守所在国家/地区法律法规与第三方平台用户协议；因滥用导致的任何责任由使用者自行承担。
 
-上游致谢：[CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)、[darknessomi/musicbox](https://github.com/darknessomi/musicbox)、洛雪音乐（LX Music）社区及其自定义源规范。
+上游致谢：本仓库在上游 [javycoder/fnos_music_ext](https://github.com/javycoder/fnos_music_ext)（MIT）与 [gzywd/fnos_music_ext](https://github.com/gzywd/fnos_music_ext) 的基础上整合而成，在此一并致谢；
+同时致谢 [CharlesPikachu/musicdl](https://github.com/CharlesPikachu/musicdl)、[darknessomi/musicbox](https://github.com/darknessomi/musicbox)、洛雪音乐（LX Music）社区及其自定义源规范。

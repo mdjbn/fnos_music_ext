@@ -56,7 +56,7 @@ def test_call_without_token_returns_error_not_raise(monkeypatch):
 def test_shared_folders_uses_env_paths_as_official_authorization(monkeypatch, tmp_path):
     """v2.9.13：系统把授权结果写进 TRIM_DATA_ACCESSIBLE_PATHS —— 这是官方授权。
 
-    真机实测该变量 = /vol1/1000/存储空间1/汇总音乐，与管理员在「应用设置 →
+    真机实测该变量形如 /vol1/1000/<共享空间名>/<音乐目录名>，与管理员在「应用设置 →
     授权目录」里勾选的完全一致。既然系统给了答案就不该再去打那个稳定 500 的
     网关，更不能因为它报错就把已授权显示成「降级」。
 
