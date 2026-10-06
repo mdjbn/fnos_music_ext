@@ -187,6 +187,32 @@ async def test_login_required_channels_absent_when_logged_out(registry_dir, monk
 
 
 @pytest.mark.anyio
+async def test_mine_channel_follows_my_playlists_switch(registry_dir, monkeypatch):
+    """「音乐页显示网易账号歌单」关掉后，mine 口径（ne: 账号歌单）不能再注入。
+
+    回归背景：用户取消勾选后飞牛音乐里仍有账号歌单——因为那批卡来自 mine 频道
+    （只受 FNMUSIC_NETEASE_CHANNELS 控制），与该开关无关。
+    """
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
+    routes = {
+        "/api/v1/playlists/user": {"ok": True, "data": [
+            {"playlist_id": 9001, "name": "我喜欢的音乐", "cover_url": ""}]},
+        "/api/v1/playlists/toplists": {"ok": True, "data": [
+            {"playlist_id": 1, "name": "飙升榜", "cover_url": ""}]},
+    }
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "false")
+    recs, _keep, _complete = await pl.collect_records(_FakeClient(routes), logged_in=True)
+    assert [r["channel"] for r in recs] == ["toplist"], "开关关闭时 mine 不该注入"
+    assert all(":ne:9001" not in str(r["guid"]) for r in recs)
+
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")
+    recs2, _keep2, _c2 = await pl.collect_records(_FakeClient(routes), logged_in=True)
+    assert "mine" in [r["channel"] for r in recs2]
+    assert any(r["guid"] == "online:playlist:ne:9001" for r in recs2)
+    assert pl.my_playlists_enabled() is True
+
+
+@pytest.mark.anyio
 async def test_public_channels_available_when_logged_out(registry_dir, monkeypatch):
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "toplist,category,newalbum")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_LIMIT", "2")
@@ -216,6 +242,7 @@ async def test_public_channels_available_when_logged_out(registry_dir, monkeypat
 @pytest.mark.anyio
 async def test_mine_playlists_mark_subscribed(registry_dir, monkeypatch):
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine")
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
     c = _FakeClient({"/api/v1/playlists/user": {"ok": True, "data": [
         {"playlist_id": 5, "name": "自建单", "cover_url": "http://p/5.jpg", "track_count": 12,
          "subscribed": False},
@@ -531,6 +558,7 @@ def _upstream_handler(request: httpx.Request) -> httpx.Response:
 
 
 def test_playlist_list_follows_custom_channel_order(registry_dir, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
     """大类顺序配置必须左右注入顺序（含 daily 的位置），时间戳严格递减。"""
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist,daily,mine")
@@ -623,6 +651,7 @@ def test_apply_explicit_order_overrides_and_appends():
 
 
 def test_playlist_list_applies_manual_order(registry_dir, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
     """playlist_list 注入顺序被手动 token 列表整体覆盖（每日推荐可被排到后面）。"""
     import httpx as _hx
     from fastapi.testclient import TestClient as _TC
@@ -658,6 +687,7 @@ def test_playlist_list_applies_manual_order(registry_dir, monkeypatch):
 
 
 def test_playlists_preview_endpoint(registry_dir, monkeypatch):
+    monkeypatch.setenv("FNMUSIC_NETEASE_MY_PLAYLISTS", "true")  # mine 口径受该总闸控制
     """管理页「歌单顺序」卡片的数据源：清单与顺序和 playlist_list 同源。"""
     import httpx as _hx
     from fastapi.testclient import TestClient as _TC

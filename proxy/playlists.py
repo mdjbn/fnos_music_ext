@@ -266,6 +266,18 @@ def channels_enabled() -> tuple[str, ...]:
     return tuple(k for k in channel_order() if k != "daily" and k in picked)
 
 
+def my_playlists_enabled() -> bool:
+    """「音乐页显示网易账号歌单」开关：**账户歌单（mine 口径）的总闸**。
+
+    A 里有两条都能给出「账号歌单」的注入路径：本模块的 mine 频道（guid 前缀
+    ``online:playlist:ne:``）与 `nmplaylists` 模块（``online:playlist:nm:``）。
+    开关关闭时两条都必须不出现——否则用户取消勾选后仍会看到账号歌单
+    （实测就是这么被发现的：mine 频道只受 FNMUSIC_NETEASE_CHANNELS 控制）。
+    """
+    raw = str(os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false") or "false")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def channel_limit() -> int:
     """每个口径最多注入几个歌单。
 
@@ -691,6 +703,9 @@ async def collect_records(client, logged_in: bool) -> tuple[list[dict], set[str]
     用户只是掉线一次就得重新等所有歌单刷新。
     """
     enabled = channels_enabled()
+    if not my_playlists_enabled():
+        # 总闸关闭：mine 口径（ne: 账号歌单）不注入，哪怕它在勾选列表里。
+        enabled = tuple(ch for ch in enabled if ch != "mine")
     todo: list[str] = []
     for ch in enabled:
         spec = CHANNELS.get(ch) or {}

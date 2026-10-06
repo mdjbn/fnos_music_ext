@@ -334,7 +334,9 @@ FIELD_UI: dict[str, dict] = {
     "netease_channels": {"page": "source", "group": "歌单与频道", "label": "频道歌单",
                          "help": "要注入飞牛歌单列表的网易云频道，逗号分隔；留空 = 全用默认。"
                                  "mine 我的歌单 / nrec 推荐歌单 / toplist 排行榜 / category 分类歌单 / "
-                                 "newalbum 新碟上架 / fm 私人FM"},
+                                 "newalbum 新碟上架 / fm 私人FM。"
+                                 "mine（我的歌单）需要先打开「音乐页显示网易账号歌单」——"
+                                 "否则即使勾了也不会注入账号歌单"},
     "netease_channel_limit": {"page": "source", "group": "歌单与频道", "label": "频道歌单数量上限",
                               "help": "1–50，每个频道最多注入多少张"},
     "netease_category": {"page": "source", "group": "歌单与频道", "label": "分类歌单的分类",
