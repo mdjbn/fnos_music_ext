@@ -2039,7 +2039,9 @@ def get_musicdl_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
 def get_musicbox_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     client = getattr(fastapi_app.state, "musicbox_client", None)
     if client is None:
-        client = httpx.AsyncClient(base_url=CONF["musicbox_url"], timeout=20.0)
+        # 收藏自动下载复用同一个 client 抓 CDN 直链 ⇒ UA 也要是浏览器 UA（见 CDN_UA 注释）
+        client = httpx.AsyncClient(base_url=CONF["musicbox_url"], timeout=20.0,
+                                   headers={"User-Agent": CDN_UA})
         fastapi_app.state.musicbox_client = client
     return client
 
@@ -2060,6 +2062,9 @@ def get_llm_client(fastapi_app: FastAPI) -> httpx.AsyncClient:
     return client
 
 
+CDN_UA = tc.CDN_UA          # 抓直链统一用浏览器 UA（见 proxy/transcode.py 的注释）
+
+
 def _new_cdn_client() -> httpx.AsyncClient:
     """进程级共享的 CDN 客户端（移植 G v2.9.30 的 `_new_cdn_client`）。
 
@@ -2073,6 +2078,7 @@ def _new_cdn_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         timeout=httpx.Timeout(connect=10.0, read=60.0, write=30.0, pool=10.0),
         follow_redirects=True,
+        headers={"User-Agent": CDN_UA},
         limits=httpx.Limits(
             max_connections=20,
             max_keepalive_connections=10,
@@ -3357,6 +3363,7 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.musicbox_client = httpx.AsyncClient(
             base_url=CONF["musicbox_url"],
             timeout=20.0,
+            headers={"User-Agent": CDN_UA},
         )
         created_musicbox = True
 
@@ -4542,7 +4549,9 @@ async def _open_online_stream(request: Request, guid: str, range_header: str | N
     """Resolve and read first bytes before committing HTTP headers to the client."""
     source = source_from_online_guid(guid)
     info, _ = _retained_track(request, guid)
-    headers = {"Accept-Encoding": "identity"}
+    # UA 必须显式带上：kuwo 这类 CDN 见到 python-httpx 的默认 UA 直接 403，
+    # 表现为「lx 音源部分歌自动下一曲」（实测 kw 全挂、wy/tx 正常）。
+    headers = {"Accept-Encoding": "identity", "User-Agent": CDN_UA}
     if range_header:
         headers["Range"] = range_header
     via_musicdl = False
@@ -5856,9 +5865,10 @@ async def _transcode_source(request: Request, guid: str) -> "tuple[str | None, d
             resolved = await resolve_lx_url(get_lx_client(request.app), song_id_from_online_guid(guid))
             if not resolved or not resolved.get("url"):
                 return None, None
-            headers = {k: str(v) for k, v in (resolved.get("headers") or {}).items()
-                       if k.lower() in ("referer", "user-agent")}
-            return str(resolved["url"]), headers or None
+            headers = {"User-Agent": CDN_UA}
+            headers.update({k: str(v) for k, v in (resolved.get("headers") or {}).items()
+                            if k.lower() in ("referer", "user-agent")})
+            return str(resolved["url"]), headers
         url = f"{str(CONF['musicdl_url']).rstrip('/')}/stream?id={quote(song_id_from_online_guid(guid))}&proxy=true"
         if _lossless_is_blacklisted(guid):
             url += "&quality=mp3"

@@ -34,6 +34,11 @@ STATE_NAME = "state.json"
 
 # 测试注入点：假 ffmpeg 脚本路径（ pytest 用，生产读环境探测）
 FFMPEG_BIN = os.environ.get("FNMUSIC_FFMPEG_BIN") or shutil.which("ffmpeg")
+
+# 中文 CDN（kuwo 等）按 User-Agent 反爬：python-httpx 与 ffmpeg 的默认 UA 会被 403。
+# 与 lxmusic-service/app.py 的 UA_PC 保持一致，凡是抓直链的请求都用它。
+CDN_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+          "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 FFPROBE_BIN = os.environ.get("FNMUSIC_FFPROBE_BIN") or shutil.which("ffprobe")
 
 
@@ -143,9 +148,8 @@ def _ffmpeg_argv(src: str, headers: dict | None, sess: Session, directory: str) 
         if headers:
             blob = "".join(f"{k}: {v}\r\n" for k, v in headers.items())
             argv += ["-headers", blob]
-        ua = (headers or {}).get("User-Agent") or (headers or {}).get("user-agent")
-        if ua:
-            argv += ["-user_agent", ua]
+        ua = (headers or {}).get("User-Agent") or (headers or {}).get("user-agent") or CDN_UA
+        argv += ["-user_agent", ua]
     argv += [
         "-i", src,
         "-vn", "-map_metadata", "-1",

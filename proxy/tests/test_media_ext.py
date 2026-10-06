@@ -52,3 +52,81 @@ def test_hls_segment_media_types():
     assert appmod._hls_segment_media(appmod.tc.INIT_NAME) == "audio/mp4"
     assert appmod._hls_segment_media("00000.m4s") == "audio/iso.segment"
     assert appmod._hls_segment_media("unknown.bin") == "application/octet-stream"
+
+
+# ----------------------------------------------------------- CDN UA ------
+
+def test_cdn_client_defaults_to_browser_ua():
+    """kuwo 等中文 CDN 对 python-httpx 默认 UA 直接 403（实测），客户端必须预置浏览器 UA。"""
+    client = appmod._new_cdn_client()
+    assert client.headers.get("user-agent") == appmod.CDN_UA
+    assert "Mozilla" in appmod.CDN_UA
+    assert appmod.CDN_UA == appmod.tc.CDN_UA
+
+
+class _FakeResp:
+    status_code = 200
+    headers = {"content-type": "audio/mp4", "content-encoding": "identity", "content-length": "4"}
+
+    async def aiter_bytes(self):
+        yield b"fLaC\x00\x00\x00\x22"
+
+    async def aclose(self):
+        pass
+
+
+class _FakeCdn:
+    def __init__(self):
+        self.seen: list[dict] = []
+
+    def build_request(self, method, url, headers=None):
+        self.seen.append(dict(headers or {}))
+        return object()
+
+    async def send(self, req, stream=True):
+        return _FakeResp()
+
+
+def test_lx_stream_request_carries_browser_ua(monkeypatch):
+    """lx 取流请求必须带浏览器 UA，否则 kuwo 全 403 → 客户端表现为自动下一曲。"""
+    import asyncio
+    from starlette.requests import Request
+
+    fake = _FakeCdn()
+    monkeypatch.setattr(appmod, "get_cdn_client", lambda _app: fake)
+    async def fake_resolve(*_a, **_k):
+        return {"url": "http://car-lv.kuwo.cn/x.m4a", "ext": "m4a"}
+
+    monkeypatch.setattr(appmod, "resolve_lx_url", fake_resolve)
+    monkeypatch.setattr(appmod, "_retained_track", lambda *a, **k: ({"ext": "m4a"}, None))
+
+    async def main():
+        req = Request({"type": "http", "app": appmod.app, "headers": [], "method": "GET",
+                       "path": "/music/api/v1/track/stream", "query_string": b"",
+                       "server": ("test", 1), "scheme": "http"})
+        return await appmod._open_online_stream(req, "online:lx:kw:378292913", None)
+
+    out = asyncio.run(main())
+    assert out is not None
+    assert fake.seen and fake.seen[0].get("User-Agent") == appmod.CDN_UA
+
+
+def test_ffmpeg_argv_defaults_to_browser_ua():
+    """转码输入也是抓远程直链：没有显式 UA 时必须回落到浏览器 UA。"""
+    import types
+
+    sess = types.SimpleNamespace(bitrate="320k", hls_time=10)
+    argv = appmod.tc._ffmpeg_argv("http://car-lv.kuwo.cn/x.m4a", None, sess, "/tmp/hls")
+    assert "-user_agent" in argv
+    assert argv[argv.index("-user_agent") + 1] == appmod.tc.CDN_UA
+
+
+def test_musicbox_client_carries_browser_ua():
+    """收藏自动下载用 musicbox 客户端抓 CDN 直链，UA 也必须是浏览器 UA。
+
+    用全新的 FastAPI 实例，避免别的用例把 app.state.musicbox_client 换成 MockTransport。
+    """
+    from fastapi import FastAPI
+
+    client = appmod.get_musicbox_client(FastAPI())
+    assert client.headers.get("user-agent") == appmod.CDN_UA
