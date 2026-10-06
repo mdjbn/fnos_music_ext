@@ -320,6 +320,7 @@ CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {
     # --- 收藏归档与红心同步 ---
     "download_dir": ("FNMUSIC_DOWNLOAD_DIR", _as_path, True),
     "download_on_favorite": ("FNMUSIC_DOWNLOAD_ON_FAVORITE", _as_bool, False),
+    "fav_sync_like": ("FNMUSIC_FAV_SYNC_LIKE", _as_bool, False),
     # --- 音质：局域网一档 / 非局域网一档（v2.9.28 起只有这两档）---
     # 「跟随飞牛」「按网络分别设置」「固定音质」三个策略与固定档一并取消：
     # 前两个依赖我们从未可靠拿到的客户端网络线索，第三个则把窄管道照灌母带。
@@ -370,6 +371,7 @@ DEFAULTS = {
     "playlist_refresh_at": "04:30",
     "download_dir": "",
     "download_on_favorite": "false",
+    "fav_sync_like": "false",
     "quality_wifi": "lossless",
     "quality_cellular": "exhigh",
 }
@@ -1821,6 +1823,11 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
           <span class="ht">取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词</span>
         </label>
 
+        <label><span class="lb">收藏同步到网易云红心</span>
+          <input type="checkbox" name="fav_sync_like">
+          <span class="ht">点收藏/取消收藏时同步写你网易云账号的红心（双向）。这是对账号的写操作，默认关闭；需要登录态可用</span>
+        </label>
+
         <label><span class="lb">音质：局域网（家里 WiFi / 内网）</span>
           <select name="quality_wifi">
             <option value="standard">标准 standard（128k）</option>
@@ -2007,7 +2014,7 @@ var $=function(s){return document.querySelector(s)};
 //     而给 checkbox 赋 value 不会改变勾选外观；
 //   - 提交时下面那句 `el.type==="checkbox"` 会把未登记的 checkbox 整个跳过，
 //     该字段不会出现在 values 里。
-var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","log_quiet"];
+var BOOLS=["free_only_on_logout","daily_enabled","local_daily_enabled","local_first","local_first_any_class","prefetch_next","pushplus_enabled","download_on_favorite","fav_sync_like","log_quiet"];
 var pollTimer=null, qrUnikey="", expireTimer=null;
 
 // 服务端注入的绝对前缀（形如 /app/fnmusicext/）。

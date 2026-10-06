@@ -68,6 +68,8 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     # A 侧决策：收藏自动下载默认关闭（FNMUSIC_DOWNLOAD_ON_FAVORITE 只是开关，
     # 开与不开都不影响 A 既有的 _register_fav_autobind 行为）
     ("FNMUSIC_DOWNLOAD_ON_FAVORITE", "false"),
+    # A 侧决策：往**用户网易云账号**写红心是对账号的写操作，默认关，要用户自己开
+    ("FNMUSIC_FAV_SYNC_LIKE", "false"),
     ("FNMUSIC_QUALITY_WIFI", "lossless"),
     ("FNMUSIC_QUALITY_CELLULAR", "exhigh"),
     ("FNMUSIC_QUALITY_DB_RESCAN", "300"),
