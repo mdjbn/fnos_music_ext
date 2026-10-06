@@ -546,12 +546,18 @@ window.addEventListener("beforeunload", (ev) => {
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
 })();
-
 /* ---------------------------------------------------------- 扩展设置 */
 // 字段表来自 /api/extended（后端 = proxy/config_schema.py，与控制台共用一份校验规则）。
-// 每个字段自带 page（source/quality/search/tee/notify/extended），页面里有对应槽位；
-// 特例：fav_sync_like 放在「音乐源 → 网易账号歌单」卡片下面。
-const EXT_SPECIAL_SLOT = { fav_sync_like: "ext-slot-source-account" };
+// 字段自带 page，页面里有页面级槽位 ext-slot-<page>；少数字段要跟已有控件放在同一张卡片里
+// （网易账号歌单、音质偏好、推荐），就单独给一个「raw 槽位」：只追加控件、不再套卡片，
+// 否则会出现两张同名卡片（用户反馈过）。
+const EXT_SPECIAL_SLOT = {
+  fav_sync_like: "ext-slot-source-account",
+  netease_quality: "ext-slot-quality-levels",
+  quality_wifi: "ext-slot-quality-levels",
+  quality_cellular: "ext-slot-quality-levels",
+};
+const EXT_RAW_SLOTS = new Set(["ext-slot-source-account", "ext-slot-quality-levels"]);
 let extFields = [];
 
 function extSlotOf(item) {
@@ -612,6 +618,21 @@ function extFieldEl(item) {
   return wrap;
 }
 
+function extSaveRow(onSave) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.style.marginTop = "10px";
+  const btn = document.createElement("button");
+  btn.className = "btn primary";
+  btn.textContent = "保存本页设置";
+  btn.addEventListener("click", () => void onSave(row));
+  const msg = document.createElement("span");
+  msg.className = "hint";
+  row.appendChild(btn);
+  row.appendChild(msg);
+  return row;
+}
+
 function renderExtended() {
   $$("[id^=ext-slot-]").forEach((el) => { el.innerHTML = ""; });
   const bySlot = new Map();
@@ -620,7 +641,17 @@ function renderExtended() {
     if (!bySlot.has(id)) bySlot.set(id, []);
     bySlot.get(id).push(it);
   });
+
+  // 1) 已有卡片内的槽位：直接追加控件（不套卡片、不加标题）
   bySlot.forEach((items, id) => {
+    if (!EXT_RAW_SLOTS.has(id)) return;
+    const slot = document.getElementById(id);
+    if (slot) items.forEach((it) => slot.appendChild(extFieldEl(it)));
+  });
+
+  // 2) 页面级槽位：按分组渲染成卡片，并在**每页末尾只放一个**保存按钮
+  bySlot.forEach((items, id) => {
+    if (EXT_RAW_SLOTS.has(id)) return;
     const slot = document.getElementById(id);
     if (!slot) return;
     const groups = [];
@@ -635,18 +666,7 @@ function renderExtended() {
       items.filter((it) => it.group === group).forEach((it) => card.appendChild(extFieldEl(it)));
       slot.appendChild(card);
     });
-    const row = document.createElement("div");
-    row.className = "row";
-    row.style.marginTop = "10px";
-    const btn = document.createElement("button");
-    btn.className = "btn primary";
-    btn.textContent = "保存本页设置";
-    btn.addEventListener("click", () => void saveExtended(row));
-    const msg = document.createElement("span");
-    msg.className = "hint";
-    row.appendChild(btn);
-    row.appendChild(msg);
-    slot.appendChild(row);
+    slot.appendChild(extSaveRow(saveExtended));
   });
 }
 

@@ -344,14 +344,18 @@ FIELD_UI: dict[str, dict] = {
     "quality_cellular": {"page": "quality", "group": "音质", "label": "音质：非局域网（流量 / 异地远程）",
                          "help": "同上；出门用流量时建议选较高或极高，避免一首歌几十 MB",
                          "choice_labels": _QUALITY_ZH},
-    "daily_enabled": {"page": "quality", "group": "推荐", "label": "每日推荐",
-                      "help": "抓取网易云官方每日推荐，生成「每日推荐」歌单"},
+    # A 里同样没有调用方（netease_auth.daily_enabled() 无人使用），而且它的名字与旧页
+    # 已有的「每日推荐」开关撞车，展示出来只会让人以为有两个一样的开关。
+    "daily_enabled": {"page": "quality", "group": "推荐", "label": "每日推荐（未实现，不展示）",
+                      "help": "抓取网易云官方每日推荐，生成「每日推荐」歌单", "hidden": True},
+    # A 侧未实现对应功能（G 的本地每日推荐 / 每日推荐条数），界面上不展示这些死开关：
+    # 展示了也调不出效果，只会让人以为「设了没用」。
     "daily_limit": {"page": "quality", "group": "推荐", "label": "每日推荐曲目数",
-                    "help": "1–100，抓取网易云官方每日推荐"},
+                    "help": "1–100，抓取网易云官方每日推荐", "hidden": True},
     "local_daily_enabled": {"page": "quality", "group": "推荐", "label": "本地每日推荐",
-                            "help": "每天从本地曲库随机抽 N 首，生成「本地每日推荐」歌单"},
+                            "help": "每天从本地曲库随机抽 N 首，生成「本地每日推荐」歌单", "hidden": True},
     "local_daily_limit": {"page": "quality", "group": "推荐", "label": "本地每日推荐曲目数",
-                          "help": "1–500，从本地曲库随机抽取的曲目数"},
+                          "help": "1–500，从本地曲库随机抽取的曲目数", "hidden": True},
     "free_only_on_logout": {"page": "quality", "group": "播放", "label": "未登录时只播免费曲目",
                             "help": "开启（默认）：未登录也能试听免费片段；关闭：未登录时完全不提供在线播放，"
                                     "搜索结果只剩本地曲库"},
@@ -419,8 +423,13 @@ GROUP_ORDER = [
 
 
 def fields_of_page(page: str) -> list[str]:
-    """某页面要渲染的字段（保持 FIELDS 的声明顺序）。"""
-    return [f for f, meta in FIELDS.items() if meta.get("page") == page]
+    """某页面要渲染的字段（保持 FIELDS 的声明顺序；`hidden` 的死开关不展示）。"""
+    return [f for f, meta in FIELDS.items() if meta.get("page") == page and not meta.get("hidden")]
+
+
+def hidden_fields() -> list[str]:
+    """A 侧没有实现对应功能、因此不在界面上展示的开关（避免用户白调）。"""
+    return [f for f, meta in FIELDS.items() if meta.get("hidden")]
 
 
 def groups_of_page(page: str) -> list[str]:

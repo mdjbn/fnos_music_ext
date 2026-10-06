@@ -448,6 +448,8 @@ async def api_extended():
     values = _ext_values(env)
     fields = []
     for field, meta in EXT_FIELDS.items():
+        if meta.get("hidden"):
+            continue          # A 侧没实现的死开关不展示（见 config_schema.hidden_fields）
         item = {"field": field, "value": values[field], **meta}
         fields.append(item)
     return {"ok": True, "groups": EXT_GROUPS, "pages": EXT_PAGES, "fields": fields,

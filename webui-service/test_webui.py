@@ -729,7 +729,8 @@ def test_extended_get_serves_all_console_fields(env_file):
     assert r.status_code == 200
     data = r.json()
     fields = {f["field"]: f for f in data["fields"]}
-    assert set(fields) == set(FIELDS)
+    visible = {f for f, m in FIELDS.items() if not m.get("hidden")}
+    assert set(fields) == visible            # 死开关（A 未实现）不下发
     item = fields["download_on_favorite"]
     assert item["kind"] == "bool"
     # .env 里没有该键时回 schema 默认值（与控制台一致），不是空串
@@ -746,14 +747,25 @@ def test_extended_fields_are_split_into_pages_with_slots(env_file):
         data = client.get("/api/extended").json()
     for page in data["pages"]:
         assert f'id="ext-slot-{page}"' in html, f"index.html 缺 {page} 的槽位"
-    # 「收藏同步到网易云红心」要放在音乐源页的网易账号歌单下面
-    assert 'id="ext-slot-source-account"' in html
+    # 「收藏同步到网易云红心」「音质」「每日推荐」要嵌进**已有卡片**里（不能再套一张同名卡）
+    for anchor, slot in (('id="netease-my-playlists"', "ext-slot-source-account"),
+                         ('id="quality-list"', "ext-slot-quality-levels")):
+        segment = html.split(anchor, 1)[1].split("\n        </div>", 1)[0]
+        assert f'id="{slot}"' in segment, f"{slot} 不在 {anchor} 所在的卡片里"
+        assert f'<div id="{slot}"></div>' in html
     assert 'data-page="notify"' in html and 'id="page-notify"' in html
-    # 枚举要能显示中文
+    # 枚举值要有中文显示名（下拉里不能出现 lossless 这种英文码）
     quality = next(f for f in data["fields"] if f["field"] == "quality_wifi")
     assert quality["choice_labels"]["lossless"] == "无损 FLAC"
     writeback = next(f for f in data["fields"] if f["field"] == "lx_sync_writeback")
     assert writeback["choice_labels"]["off"].startswith("只读")
+
+
+def test_app_js_creates_exactly_one_save_row_per_page(env_file):
+    """回归：音源页曾出现两个「保存本页设置」按钮（每个槽位各一个）。"""
+    js = (HERE / "static" / "app.js").read_text(encoding="utf-8")
+    assert js.count("保存本页设置") == 1, "保存按钮只能在 extSaveRow 里创建一次"
+    assert "EXT_RAW_SLOTS" in js and "ext-slot-source-account" in js
 
 
 def test_extended_put_writes_masks_and_keeps_untouched(env_file):

@@ -86,12 +86,25 @@ def test_choices_all_have_chinese_display_labels():
         assert not missing, f"{field} 的枚举缺中文显示名：{missing}"
 
 
-def test_pages_cover_all_fields_exactly_once():
+def test_pages_cover_all_visible_fields_exactly_once():
     covered = []
     for page in cs.PAGES:
         covered += cs.fields_of_page(page)
-    assert sorted(covered) == sorted(cs.FIELDS), "有字段没被任何页面收走"
+    visible = [f for f in cs.FIELDS if f not in cs.hidden_fields()]
+    assert sorted(covered) == sorted(visible), "有字段没被任何页面收走"
     assert len(covered) == len(set(covered)), "同一字段出现在多个页面"
+
+
+def test_hidden_fields_are_the_known_dead_switches():
+    """A 侧没实现 G 的本地每日推荐/每日推荐条数：这些开关不能展示，否则用户白调。
+
+    它们仍留在 FIELDS 里（控制台的字段表/校验保持不变），只是不进旧音源页的界面。
+    """
+    assert set(cs.hidden_fields()) == {"daily_enabled", "daily_limit",
+                                     "local_daily_enabled", "local_daily_limit"}
+    for field in cs.hidden_fields():
+        assert field in cs.FIELDS and cs.FIELDS[field].get("hidden") is True
+        assert field not in cs.fields_of_page(cs.FIELDS[field]["page"])
 
 
 def test_groups_of_page_are_consistent():
