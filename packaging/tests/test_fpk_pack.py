@@ -2,7 +2,7 @@
 
 通过 build.sh --stage-only 组装打包目录后校验：
 - manifest 必填字段、版本与仓库 VERSION 一致、入口名以应用名为前缀
-- ui/config 桌面入口（iframe + 8774）与 manifest 的 desktop_applaunchname 一致
+- ui/config 桌面入口（iframe + 网关路径 /app/fnmusic-ext/admin/）与 manifest 的 desktop_applaunchname 一致
 - fnpack 逆向校验规则：wizard initValue 必须是字符串、tips 用 helpText
 - 图标存在且尺寸正确（纯 struct 解析 PNG IHDR，无 PIL 依赖）
 - cmd 生命周期脚本存在且可执行
@@ -98,7 +98,9 @@ class TestUiConfig:
         # 空端口 + 网关路径：桌面是 HTTPS，不能把管理页嵌成 http://主机:8774
         assert entry["port"] == ""
         assert entry["protocol"] == "http"
-        assert entry["url"] == "/app/fnmusic-ext/"
+        # 桌面图标直接开**完整管理控制台**：旧版 /app/fnmusic-ext/ 是 A 自带音源页，
+        # 设置项少（用户反馈过「图标打开的页面缺少很多设置项」）；控制台顶部有反向链接。
+        assert entry["url"] == "/app/fnmusic-ext/admin/"
         assert entry["gatewayPrefix"] == "/app/fnmusic-ext"
         assert entry["gatewaySocket"] == "fnmusic-ext.sock"
         assert entry["allUsers"] is False

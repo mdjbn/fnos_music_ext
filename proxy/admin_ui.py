@@ -1723,7 +1723,7 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
 <body>
 <div class="wrap">
   <h1>飞牛音乐扩展</h1>
-  <div class="sub">网易云单源 · 当前用户 <b>__USERNAME__</b> · <span id="ver">…</span></div>
+  <div class="sub">当前用户 <b>__USERNAME__</b> · <span id="ver">…</span> · <a href="/app/fnmusic-ext/" target="_blank" rel="noopener">旧版音源设置页</a> · <span class="sub" style="margin:0">本页是完整管理控制台（桌面图标直接打开这里）</span></div>
 
   <div class="card">
     <h2>运行状态</h2>

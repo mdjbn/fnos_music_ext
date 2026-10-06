@@ -91,6 +91,8 @@ def test_admin_page_renders_with_username():
         assert r.status_code == 200
         assert "gzy" in r.text
         assert "飞牛音乐扩展" in r.text
+        # 控制台要能回到 A 自带的音源设置页（桌面图标只指向控制台，别把老页面弄丢）
+        assert 'href="/app/fnmusic-ext/"' in r.text
         # 单文件、零外部依赖：不允许出现任何 CDN / 外链脚本
         lowered = r.text.lower()
         assert "https://cdn" not in lowered and "<script src" not in lowered
