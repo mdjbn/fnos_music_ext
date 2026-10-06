@@ -261,3 +261,169 @@ def coerce(field: str, raw: Any) -> str:
     if kind == "playlist_order":
         return _as_playlist_order(raw)
     return _free_text(meta.get("max_len", 200))(raw)
+
+# ---------------------------------------------------------------------------
+# 界面元数据（人工维护）：中文文案 + 分组 + **归属页面** + 枚举的显示名
+# ---------------------------------------------------------------------------
+# 为什么单独一张表：FIELDS 的 label/help 是从控制台 HTML 抽取的，缺控件的字段会退化成
+# 英文键名（free_only_on_logout 等），个别还抽错了配对（daily_enabled 拿到了别人家的说明）。
+# 这里逐项覆盖，并给每个字段指定它出现在 A 自带音源页的哪一页：
+#   source   音乐源（洛雪同步 / 网易账号歌单 / 歌单与频道）
+#   quality  播放与推荐（音质 / 推荐 / 播放 / 本地曲库）
+#   search   搜索
+#   tee      边听边存（收藏归档）
+#   notify   通知（PushPlus）
+#   extended 扩展设置（日志与巡检，剩下的都在这）
+PAGES: dict[str, str] = {
+    "source": "音乐源",
+    "quality": "播放与推荐",
+    "search": "搜索",
+    "tee": "边听边存",
+    "notify": "通知",
+    "extended": "扩展设置",
+}
+
+_QUALITY_ZH = {"standard": "标准 128k", "higher": "较高 192k", "exhigh": "极高 320k",
+               "lossless": "无损 FLAC", "hires": "高清无损 Hi-Res", "jymaster": "臻品母带"}
+
+FIELD_UI: dict[str, dict] = {
+    # ---- 音乐源 · 洛雪歌单同步 ----
+    "lx_sync_enabled": {"page": "source", "group": "洛雪歌单同步", "label": "同步洛雪歌单",
+                        "help": "把 lx-music-sync-server（洛雪客户端「设置 → 同步」里那个服务）里的歌单，"
+                                "作为只读歌单注入飞牛音乐的歌单列表"},
+    "lx_sync_url": {"page": "source", "group": "洛雪歌单同步", "label": "洛雪同步服务地址",
+                    "help": "例如 http://192.168.1.10:9527 或 https://域名:9528/用户名"
+                            "（增强版把用户名放在路径里）。填错会在保存时直接报错"},
+    "lx_sync_password": {"page": "source", "group": "洛雪歌单同步", "label": "洛雪同步服务密码",
+                         "help": "服务端 config.js 里 users[].password（或环境变量 LX_USER_&lt;用户名&gt;）。"
+                                 "用户名不用填：服务端是拿密码匹配账号的。留空 = 保持原值"},
+    "lx_sync_refresh_s": {"page": "source", "group": "洛雪歌单同步", "label": "洛雪歌单刷新间隔（秒）",
+                          "help": "默认 300。第一次打开歌单列表会等一次同步（最多 8 秒），之后读缓存、"
+                                  "后台按这个间隔刷新；服务端连不上时继续显示上一次的结果"},
+    "lx_sync_device": {"page": "source", "group": "洛雪歌单同步", "label": "本机在洛雪同步里的设备名",
+                       "help": "只影响同步服务「设备列表」里显示的名字，方便认出这是飞牛插件"},
+    "lx_sync_insecure_tls": {"page": "source", "group": "洛雪歌单同步", "label": "跳过证书校验（自签证书才勾）",
+                             "help": "只在服务端用自签 https 证书时需要。勾了之后到该地址的流量不再校验身份，"
+                                     "域名证书正常时不要勾"},
+    "lx_sync_writeback": {"page": "source", "group": "洛雪歌单同步", "label": "洛雪歌单回写档位",
+                          "help": "只读：在飞牛里加/删歌只是本地动作；可增删歌：会真写回同步服务"
+                                  "（电脑手机会看到）；可删歌单：额外允许在飞牛里删掉整张洛雪歌单，"
+                                  "<b>对所有设备生效</b>（服务端保留快照，误删可在管理控制台还原）",
+                          "choice_labels": {"off": "只读（不写回）", "tracks": "可增删歌",
+                                            "all": "可增删歌 + 可删歌单"}},
+    # ---- 音乐源 · 网易账号歌单 ----
+    "fav_sync_like": {"page": "source", "group": "网易账号歌单", "label": "收藏同步到网易云红心",
+                      "help": "点收藏/取消收藏时同步写你网易云账号的红心（双向）。这是对账号的写操作，"
+                              "默认关闭；需要登录态可用"},
+    # ---- 音乐源 · 歌单与频道 ----
+    "netease_channels": {"page": "source", "group": "歌单与频道", "label": "频道歌单",
+                         "help": "要注入飞牛歌单列表的网易云频道（榜/分类/我的/新碟/电台），"
+                                 "逗号分隔；留空 = 全用默认"},
+    "netease_channel_limit": {"page": "source", "group": "歌单与频道", "label": "频道歌单数量上限",
+                              "help": "1–50，每个频道最多注入多少张"},
+    "netease_category": {"page": "source", "group": "歌单与频道", "label": "分类歌单的分类",
+                         "help": "华语 / 欧美 / 日语 / 韩语 / 粤语 / 流行 / 摇滚 / 民谣 / 电子 ……"},
+    "netease_channel_order": {"page": "source", "group": "歌单与频道", "label": "歌单大类顺序",
+                              "help": "飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值：daily（网易云每日推荐）"
+                                      "/ localdaily（本地每日推荐）/ hot（热门）/ category（分类）/ "
+                                      "my（我的）/ newalbums（新碟）/ radio（电台）"},
+    "netease_playlist_order": {"page": "source", "group": "歌单与频道", "label": "歌单展示顺序",
+                               "help": "按 guid 精确排序，逗号分隔（一般不用手填，页面上的拖拽会写这个值）"},
+    "playlist_track_limit": {"page": "source", "group": "歌单与频道", "label": "歌单曲目上限",
+                             "help": "1–1000，点开歌单时最多解析多少首（越多越慢）"},
+    "playlist_cache_ttl_h": {"page": "source", "group": "歌单与频道", "label": "歌单缓存有效期（小时）",
+                             "help": "缓存期内点开歌单直接读本地（秒开）；超期后先返回缓存、后台自动刷新"},
+    "playlist_refresh_at": {"page": "source", "group": "歌单与频道", "label": "每日定时刷新歌单缓存",
+                            "help": "每天在这个时间后台刷新全部歌单曲目，格式 HH:MM（如 04:30），留空关闭"},
+    # ---- 播放与推荐 ----
+    "netease_quality": {"page": "quality", "group": "音质", "label": "网易云音质（登录账号）",
+                        "help": "账号无对应权益时上游会自动回退，不会因此播放失败", "choice_labels": _QUALITY_ZH},
+    "quality_wifi": {"page": "quality", "group": "音质", "label": "音质：局域网（家里 WiFi / 内网）",
+                     "help": "档位与网易云音乐一致，由低到高；账号无对应权益时上游自动降级",
+                     "choice_labels": _QUALITY_ZH},
+    "quality_cellular": {"page": "quality", "group": "音质", "label": "音质：非局域网（流量 / 异地远程）",
+                         "help": "同上；出门用流量时建议选较高或极高，避免一首歌几十 MB",
+                         "choice_labels": _QUALITY_ZH},
+    "daily_enabled": {"page": "quality", "group": "推荐", "label": "每日推荐",
+                      "help": "抓取网易云官方每日推荐，生成「每日推荐」歌单"},
+    "daily_limit": {"page": "quality", "group": "推荐", "label": "每日推荐曲目数",
+                    "help": "1–100，抓取网易云官方每日推荐"},
+    "local_daily_enabled": {"page": "quality", "group": "推荐", "label": "本地每日推荐",
+                            "help": "每天从本地曲库随机抽 N 首，生成「本地每日推荐」歌单"},
+    "local_daily_limit": {"page": "quality", "group": "推荐", "label": "本地每日推荐曲目数",
+                          "help": "1–500，从本地曲库随机抽取的曲目数"},
+    "free_only_on_logout": {"page": "quality", "group": "播放", "label": "未登录时只播免费曲目",
+                            "help": "开启（默认）：未登录也能试听免费片段；关闭：未登录时完全不提供在线播放，"
+                                    "搜索结果只剩本地曲库"},
+    "prefetch_next": {"page": "quality", "group": "播放", "label": "预取下一首",
+                      "help": "提前取回下一首的直链与元数据，切歌更快；只取 JSON、不下载音频"},
+    "prefetch_lookahead": {"page": "quality", "group": "播放", "label": "预取首数（1–5）",
+                           "help": "一次预取当前曲之后的几首。多预取几首几乎不额外耗流量"},
+    "library_dir": {"page": "quality", "group": "本地曲库", "label": "本地曲库目录（留空=自动探测）",
+                    "help": "自动探测依赖飞牛的 music.db；各版本目录布局不统一，猜不中时本地每日推荐/本地优先"
+                            "会一首歌都扫不到。此时直接填曲库目录，例如 /vol1/1000/music"},
+    "local_first": {"page": "quality", "group": "本地曲库", "label": "本地曲库优先",
+                    "help": "播网易云歌单时优先读本地同名文件，命中就不走网络"},
+    "local_first_any_class": {"page": "quality", "group": "本地曲库", "label": "本地优先不限制音质档",
+                              "help": "开启后任何音质档都优先用本地文件；关闭时只在高音质档优先"},
+    # ---- 搜索 ----
+    "netease_search_limit": {"page": "search", "group": "搜索", "label": "单次搜索请求条数",
+                             "help": "1–100，向网易云请求的候选数量"},
+    "online_limit": {"page": "search", "group": "搜索", "label": "搜索结果并入上限",
+                     "help": "1–100，最终显示在飞牛搜索列表里的在线条数"},
+    "search_cache_ttl_days": {"page": "search", "group": "搜索", "label": "搜索缓存有效期（天）",
+                              "help": "0 表示不缓存"},
+    # ---- 边听边存 ----
+    "download_dir": {"page": "tee", "group": "收藏归档", "label": "收藏归档目录",
+                     "help": "必须是已存在的可写<b>绝对路径</b>；系统目录会被拒绝。"
+                             "按 <code>歌手/歌手 - 歌名.flac</code> 落盘并配同名 .lrc；留空 = 不归档"},
+    "download_on_favorite": {"page": "tee", "group": "收藏归档", "label": "点收藏时自动下载",
+                             "help": "取账号能拿到的最高品质（jymaster→hires→lossless→exhigh 逐档降级），配歌词"},
+    # ---- 通知 ----
+    "pushplus_enabled": {"page": "notify", "group": "PushPlus 推送", "label": "启用 PushPlus 推送提醒",
+                         "help": "登录失效 / 首次未登录 / 登录成功 / VIP 临期时推送到微信"},
+    "pushplus_token": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus token",
+                       "help": "到 pushplus.plus 个人中心复制；该服务需实名认证，否则收不到推送。"
+                               "<b>留空 = 保持原值</b>"},
+    "pushplus_topic": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus 群组编码",
+                       "help": "填了就推送到该群组（一对多）"},
+    "pushplus_template": {"page": "notify", "group": "PushPlus 推送", "label": "消息模板",
+                          "help": "PushPlus 支持的消息格式",
+                          "choice_labels": {"markdown": "Markdown（推荐）", "html": "HTML",
+                                            "txt": "纯文本", "json": "JSON"}},
+    "pushplus_url": {"page": "notify", "group": "PushPlus 推送", "label": "PushPlus 接口地址",
+                     "help": "一般不用改，除非你自建了转发"},
+    # ---- 扩展设置（剩下的）----
+    "login_check_interval_h": {"page": "extended", "group": "日志与巡检", "label": "登录态巡检间隔（小时）",
+                               "help": "0 表示只在请求时按需探测"},
+    "log_max_mb": {"page": "extended", "group": "日志与巡检", "label": "单个日志文件上限（MB）",
+                   "help": "超过即就地截断保留最近一半，0 表示不限制"},
+    "log_max_days": {"page": "extended", "group": "日志与巡检", "label": "日志保留天数",
+                     "help": "超期的备份日志直接删除、超期的活跃日志清空，0 表示永久保留"},
+    "log_quiet": {"page": "extended", "group": "日志与巡检", "label": "日志降噪",
+                  "help": "默认开：不记封面、5 秒保活心跳、客户端状态轮询这类高频访问行。"
+                          "排障时可关掉看完整原始日志（代价是日志涨得快）"},
+}
+
+for _field, _ui in FIELD_UI.items():
+    if _field not in FIELDS:
+        raise KeyError(f"FIELD_UI 里的 {_field} 不在 FIELDS 中")
+    FIELDS[_field].update(_ui)
+
+# 分组顺序按「页面内的展示顺序」排（页面由 page 决定，组只影响页内分块）
+GROUP_ORDER = [
+    "洛雪歌单同步", "网易账号歌单", "歌单与频道",
+    "音质", "推荐", "播放", "本地曲库",
+    "搜索", "收藏归档", "PushPlus 推送", "日志与巡检",
+]
+
+
+def fields_of_page(page: str) -> list[str]:
+    """某页面要渲染的字段（保持 FIELDS 的声明顺序）。"""
+    return [f for f, meta in FIELDS.items() if meta.get("page") == page]
+
+
+def groups_of_page(page: str) -> list[str]:
+    """某页面内的分组顺序（保持 GROUP_ORDER 的顺序）。"""
+    used = {FIELDS[f].get("group") for f in fields_of_page(page)}
+    return [g for g in GROUP_ORDER if g in used]

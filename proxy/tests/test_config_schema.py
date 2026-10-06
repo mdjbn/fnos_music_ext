@@ -3,6 +3,8 @@
 `proxy/config_schema.py` 是控制台与 A 自带音源页「扩展设置」共用的唯一校验表；
 一旦它和 `admin_ui.CONFIG_FIELDS` 漂移，就会出现「一个页面能存、另一个存不进去」。
 """
+import re
+
 import pytest
 
 from proxy import admin_ui
@@ -63,3 +65,55 @@ def test_path_kind_shares_download_rule(tmp_path, monkeypatch):
         cs.coerce("download_dir", "/etc")
     with pytest.raises(ValueError):
         cs.coerce("download_dir", str(tmp_path / "not-there"))
+
+
+# ------------------------------------------------- 界面元数据（翻译 + 分页）----
+
+def test_every_field_has_chinese_label_help_and_page():
+    for field, meta in cs.FIELDS.items():
+        assert meta["page"] in cs.PAGES, f"{field} 的 page 非法"
+        label = meta.get("label") or ""
+        assert not re.fullmatch(r"[a-z_0-9]+", label), f"{field} 的标题还是英文键名：{label}"
+        assert meta.get("help"), f"{field} 缺中文说明"
+
+
+def test_choices_all_have_chinese_display_labels():
+    for field, meta in cs.FIELDS.items():
+        if "choices" not in meta:
+            continue
+        labels = meta.get("choice_labels") or {}
+        missing = [c for c in meta["choices"] if c not in labels]
+        assert not missing, f"{field} 的枚举缺中文显示名：{missing}"
+
+
+def test_pages_cover_all_fields_exactly_once():
+    covered = []
+    for page in cs.PAGES:
+        covered += cs.fields_of_page(page)
+    assert sorted(covered) == sorted(cs.FIELDS), "有字段没被任何页面收走"
+    assert len(covered) == len(set(covered)), "同一字段出现在多个页面"
+
+
+def test_groups_of_page_are_consistent():
+    for page in cs.PAGES:
+        groups = cs.groups_of_page(page)
+        for field in cs.fields_of_page(page):
+            assert cs.FIELDS[field]["group"] in groups
+
+
+def test_requested_placements():
+    """用户点名的归位：洛雪→音乐源、音质/推荐/播放→播放与推荐、PushPlus→通知、
+    红心同步→音乐源（网易账号歌单组）、收藏自动下载→边听边存。"""
+    page_of = {f: m["page"] for f, m in cs.FIELDS.items()}
+    for field in ("lx_sync_enabled", "lx_sync_url", "lx_sync_password", "lx_sync_writeback"):
+        assert page_of[field] == "source"
+    assert cs.FIELDS["fav_sync_like"]["group"] == "网易账号歌单"
+    assert page_of["fav_sync_like"] == "source"
+    for field in ("netease_quality", "quality_wifi", "quality_cellular", "daily_enabled",
+                  "daily_limit", "local_daily_enabled", "local_first", "prefetch_next"):
+        assert page_of[field] == "quality", field
+    for field in ("pushplus_enabled", "pushplus_token", "pushplus_topic", "pushplus_template",
+                  "pushplus_url"):
+        assert page_of[field] == "notify", field
+    assert page_of["download_on_favorite"] == "tee"
+    assert page_of["download_dir"] == "tee"

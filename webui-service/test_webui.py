@@ -736,6 +736,24 @@ def test_extended_get_serves_all_console_fields(env_file):
     assert item["value"] == FIELDS["download_on_favorite"]["default"] == "false"
     for item in data["fields"]:
         assert item["label"] and item["group"] in data["groups"]
+        assert item["page"] in data["pages"], f"{item['field']} 的 page 不在 pages 里"
+
+
+def test_extended_fields_are_split_into_pages_with_slots(env_file):
+    """用户要求按页面拆分：字段自带 page，旧页 HTML 必须有对应槽位，否则控件会丢。"""
+    html = (HERE / "static" / "index.html").read_text(encoding="utf-8")
+    with authed_client() as client:
+        data = client.get("/api/extended").json()
+    for page in data["pages"]:
+        assert f'id="ext-slot-{page}"' in html, f"index.html 缺 {page} 的槽位"
+    # 「收藏同步到网易云红心」要放在音乐源页的网易账号歌单下面
+    assert 'id="ext-slot-source-account"' in html
+    assert 'data-page="notify"' in html and 'id="page-notify"' in html
+    # 枚举要能显示中文
+    quality = next(f for f in data["fields"] if f["field"] == "quality_wifi")
+    assert quality["choice_labels"]["lossless"] == "无损 FLAC"
+    writeback = next(f for f in data["fields"] if f["field"] == "lx_sync_writeback")
+    assert writeback["choice_labels"]["off"].startswith("只读")
 
 
 def test_extended_put_writes_masks_and_keeps_untouched(env_file):

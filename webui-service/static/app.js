@@ -548,8 +548,21 @@ window.addEventListener("beforeunload", (ev) => {
 })();
 
 /* ---------------------------------------------------------- 扩展设置 */
-// 字段表来自 /api/extended（后端用 proxy/config_schema.py：与桌面控制台同一份校验规则），
-// 所以控制台以后新增字段，这里不用改前端就能显示出来。
+// 字段表来自 /api/extended（后端 = proxy/config_schema.py，与控制台共用一份校验规则）。
+// 每个字段自带 page（source/quality/search/tee/notify/extended），页面里有对应槽位；
+// 特例：fav_sync_like 放在「音乐源 → 网易账号歌单」卡片下面。
+const EXT_SPECIAL_SLOT = { fav_sync_like: "ext-slot-source-account" };
+let extFields = [];
+
+function extSlotOf(item) {
+  return EXT_SPECIAL_SLOT[item.field] || ("ext-slot-" + (item.page || "extended"));
+}
+
+function extChoiceText(item, value) {
+  const labels = item.choice_labels || {};
+  return labels[value] || value;
+}
+
 function extFieldEl(item) {
   const wrap = document.createElement("label");
   wrap.className = "field";
@@ -568,7 +581,7 @@ function extFieldEl(item) {
     item.choices.forEach((c) => {
       const opt = document.createElement("option");
       opt.value = c;
-      opt.textContent = c;
+      opt.textContent = extChoiceText(item, c);
       input.appendChild(opt);
     });
     input.value = item.value || item.choices[0];
@@ -599,45 +612,66 @@ function extFieldEl(item) {
   return wrap;
 }
 
-async function loadExtended() {
-  const box = $("#ext-body");
-  if (!box) return;
-  box.className = "muted";
-  box.textContent = "加载中…";
-  try {
-    const data = await api("/api/extended");
-    const values = data.values || {};
-    box.className = "";
-    box.innerHTML = "";
-    (data.groups || []).forEach((group) => {
-      const items = (data.fields || []).filter((f) => f.group === group);
-      if (!items.length) return;
+function renderExtended() {
+  $$("[id^=ext-slot-]").forEach((el) => { el.innerHTML = ""; });
+  const bySlot = new Map();
+  extFields.forEach((it) => {
+    const id = extSlotOf(it);
+    if (!bySlot.has(id)) bySlot.set(id, []);
+    bySlot.get(id).push(it);
+  });
+  bySlot.forEach((items, id) => {
+    const slot = document.getElementById(id);
+    if (!slot) return;
+    const groups = [];
+    items.forEach((it) => { if (!groups.includes(it.group)) groups.push(it.group); });
+    groups.forEach((group) => {
       const card = document.createElement("div");
       card.className = "card";
       const title = document.createElement("div");
       title.className = "card-title";
       title.textContent = group;
       card.appendChild(title);
-      items.forEach((it) => card.appendChild(extFieldEl(it)));
-      box.appendChild(card);
+      items.filter((it) => it.group === group).forEach((it) => card.appendChild(extFieldEl(it)));
+      slot.appendChild(card);
     });
-    if (!box.children.length) box.textContent = "没有可显示的扩展设置项";
-    void values;
+    const row = document.createElement("div");
+    row.className = "row";
+    row.style.marginTop = "10px";
+    const btn = document.createElement("button");
+    btn.className = "btn primary";
+    btn.textContent = "保存本页设置";
+    btn.addEventListener("click", () => void saveExtended(row));
+    const msg = document.createElement("span");
+    msg.className = "hint";
+    row.appendChild(btn);
+    row.appendChild(msg);
+    slot.appendChild(row);
+  });
+}
+
+async function loadExtended(force) {
+  if (extFields.length && !force) {
+    renderExtended();
+    return;
+  }
+  try {
+    const data = await api("/api/extended");
+    extFields = data.fields || [];
+    renderExtended();
   } catch (err) {
-    box.className = "muted";
-    box.textContent = "加载失败：" + err.message;
+    const slot = document.getElementById("ext-slot-extended");
+    if (slot) slot.textContent = "扩展设置加载失败：" + err.message;
   }
 }
 
-async function saveExtended() {
-  const box = $("#ext-body");
-  const msg = $("#ext-msg");
-  if (!box || !msg) return;
+async function saveExtended(row) {
+  const msg = row ? row.querySelector(".hint") : null;
   const values = {};
-  $$("#ext-body [data-field]").forEach((el) => {
+  $$("[data-field]").forEach((el) => {
     values[el.dataset.field] = el.dataset.kind === "bool" ? (el.checked ? "true" : "false") : el.value;
   });
-  msg.textContent = "保存中…";
+  if (msg) msg.textContent = "保存中…";
   try {
     const data = await api("/api/extended", {
       method: "PUT",
@@ -645,16 +679,18 @@ async function saveExtended() {
       body: JSON.stringify({ values }),
     });
     const n = (data.changed || []).length;
-    msg.textContent = n ? `已保存 ${n} 项，约 2 秒内生效` : "没有需要保存的改动";
-    toast(msg.textContent);
-    await loadExtended();
+    const text = n ? `已保存 ${n} 项，约 2 秒内生效` : "没有需要保存的改动";
+    if (msg) msg.textContent = text;
+    toast(text);
+    await loadExtended(true);
   } catch (err) {
-    msg.textContent = "保存失败：" + err.message;
+    if (msg) msg.textContent = "保存失败：" + err.message;
+    else toast("保存失败：" + err.message, "err");
   }
 }
 
-$$("[data-page]").forEach((btn) => btn.addEventListener("click", () => {
-  if (btn.dataset.page === "extended") void loadExtended();
-}));
-const extSaveBtn = $("#ext-save");
-if (extSaveBtn) extSaveBtn.addEventListener("click", () => void saveExtended());
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", () => void loadExtended());
+} else {
+  void loadExtended();
+}

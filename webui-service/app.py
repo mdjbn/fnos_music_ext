@@ -25,7 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
-from proxy.config_schema import FIELDS as EXT_FIELDS, GROUP_ORDER as EXT_GROUPS, coerce as ext_coerce  # noqa: E402
+from proxy.config_schema import (  # noqa: E402
+    FIELDS as EXT_FIELDS,
+    GROUP_ORDER as EXT_GROUPS,
+    PAGES as EXT_PAGES,
+    coerce as ext_coerce,
+)
 from proxy.env_merge import (  # noqa: E402
     parse_env_file,
     preserve_user_comments,
@@ -434,14 +439,19 @@ def _ext_values(env: dict) -> dict:
 
 @app.get("/api/extended")
 async def api_extended():
-    """扩展设置页的字段表 + 当前值（校验规则与控制台共用 proxy/config_schema.py）。"""
+    """扩展设置字段表 + 当前值（校验规则与控制台共用 proxy/config_schema.py）。
+
+    每个字段带 `page`（source/quality/search/tee/notify/extended），旧音源页按它把控件
+    渲染进对应页面；枚举值带 `choice_labels` 供前端显示中文。
+    """
     env = read_env()
     values = _ext_values(env)
     fields = []
     for field, meta in EXT_FIELDS.items():
         item = {"field": field, "value": values[field], **meta}
         fields.append(item)
-    return {"ok": True, "groups": EXT_GROUPS, "fields": fields, "env_path": str(ENV_PATH)}
+    return {"ok": True, "groups": EXT_GROUPS, "pages": EXT_PAGES, "fields": fields,
+            "env_path": str(ENV_PATH)}
 
 
 class ExtendedBody(BaseModel):
