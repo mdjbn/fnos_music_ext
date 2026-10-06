@@ -140,15 +140,33 @@ def test_toggle_off_no_injection():
         CONF["netease_my_playlists"] = True
 
 
-def test_source_disabled_no_injection():
+def test_source_disabled_no_injection(monkeypatch):
     mb = _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
     CONF["netease_enabled"] = False
+    # 账号歌单开关也关掉才算「源不可用」：开关打开时 WebUI 会保活音乐盒进程，
+    # 洛雪/网盘音源下照样能取账号歌单（见 test_account_playlists_switch_survives_source_off）
+    monkeypatch.setitem(CONF, "netease_my_playlists", False)
     try:
         with TestClient(app) as client:
             resp = client.get("/music/api/v1/playlist/list")
             lst = resp.json()["data"]["list"]
         assert [it["guid"] for it in lst] == ["localpl"]
         assert mb.state["calls"] == 0
+    finally:
+        CONF["netease_enabled"] = True
+
+
+def test_account_playlists_switch_survives_source_off(monkeypatch):
+    """音源不是网易云、但账号歌单开关打开：音乐盒被保活，账号歌单照常注入。"""
+    mb = _wire(_musicbox_handler(rows=PLAYLIST_ROWS, tracks=TRACK_ROWS))
+    CONF["netease_enabled"] = False
+    monkeypatch.setitem(CONF, "netease_my_playlists", True)
+    try:
+        with TestClient(app) as client:
+            resp = client.get("/music/api/v1/playlist/list")
+            guids = [it["guid"] for it in resp.json()["data"]["list"]]
+        assert guids == ["online:playlist:nm:111", "online:playlist:nm:333", "localpl"]
+        assert mb.state["calls"] == 1
     finally:
         CONF["netease_enabled"] = True
 

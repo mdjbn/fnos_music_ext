@@ -36,3 +36,4 @@ dist/
 packaging/fpk/.build/
 
 .cursor/
+nm_playlists_cache/

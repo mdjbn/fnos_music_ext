@@ -859,3 +859,156 @@ def test_put_extended_turns_coercer_bug_into_readable_400(env_file, monkeypatch)
         assert r.status_code == 400
         assert "校验器异常" in r.json()["error"]
 
+
+# ------------------------------------------- 附加音源：洛雪/网盘下的网易账号歌单 ---
+# 用户需求：用洛雪音源时也要能看到/播放网易账号歌单。做法是把「音乐页显示网易账号歌单」
+# 开关升级为**附加音源保活**：开关打开且当前音源不是音乐盒时，让 musicbox 进程常驻。
+
+# 逐行改，别在开头插一行后在文件末尾留下同名旧值（read_env 里后出现的会覆盖前面的）
+AUX_ENV = BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+AUX_ENV = AUX_ENV.replace("FNMUSIC_LX_ENABLED='false'", "FNMUSIC_LX_ENABLED='true'")
+AUX_ENV = AUX_ENV.replace(
+    "FNMUSIC_MUSICDL_ENABLED='false'",
+    "FNMUSIC_MUSICDL_ENABLED='false'\nFNMUSIC_NETEASE_MY_PLAYLISTS='true'",
+)
+assert AUX_ENV.count("FNMUSIC_LX_ENABLED") == 1 and AUX_ENV.count("FNMUSIC_NETEASE_MY_PLAYLISTS") == 1
+
+
+def test_netease_aux_needed_truth_table():
+    """只有「开关打开 + 音源不是音乐盒」才需要附加常驻。"""
+    def values(**kw):
+        base = {"FNMUSIC_NETEASE_ENABLED": "false", "FNMUSIC_LX_ENABLED": "true",
+                "FNMUSIC_MUSICDL_ENABLED": "false"}
+        base.update(kw)
+        return base
+
+    assert webui.netease_aux_needed(values(FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is True
+    assert webui.netease_aux_needed(values(FNMUSIC_NETEASE_MY_PLAYLISTS="false")) is False
+    # 音源就是音乐盒：它本来就常驻，不算附加
+    assert webui.netease_aux_needed(values(
+        FNMUSIC_LX_ENABLED="false", FNMUSIC_NETEASE_ENABLED="true",
+        FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is False
+    # 一个音源都没启用（三选一校验会拦住保存）：不伺候
+    assert webui.netease_aux_needed(values(
+        FNMUSIC_LX_ENABLED="false", FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is False
+
+
+def test_switch_to_lx_with_account_playlists_keeps_musicbox(env_file, svctl):
+    """洛雪音源 + 账号歌单开关：音乐盒作为附加音源不被停，且被保活拉起。"""
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false",
+            "FNMUSIC_LX_ENABLED": "true",
+            "FNMUSIC_NETEASE_MY_PLAYLISTS": "true",
+        }})
+        assert r.status_code == 200
+    assert ("stop", "musicbox") not in svctl.calls
+    assert ("start", "lxmusic") in svctl.calls
+    assert ("start", "musicbox") in svctl.calls
+
+
+def test_turning_account_playlists_off_releases_musicbox(env_file, svctl):
+    """洛雪音源下关掉开关：回收附加的 musicbox（内存还回去）。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_MY_PLAYLISTS": "false"}})
+        assert r.status_code == 200
+    assert ("stop", "musicbox") in svctl.calls
+
+
+def test_release_keeps_musicbox_while_previewing(env_file, svctl):
+    """正在预览音乐盒（扫码/试听）时不能因为关开关把它掐掉。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    webui._preview_until["musicbox"] = time.monotonic() + 300
+    webui.release_netease_aux(webui.read_env())
+    assert ("stop", "musicbox") not in svctl.calls
+
+
+def test_preview_reap_hands_musicbox_to_aux(env_file, svctl):
+    """到期的 musicbox 预览已被附加保活接管：只移出预览表，不停进程。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    webui._preview_until["musicbox"] = time.monotonic() - 1
+    webui.preview_reap()
+    assert ("stop", "musicbox") not in svctl.calls
+    assert "musicbox" not in webui._preview_until
+
+
+def test_status_marks_aux_musicbox(env_file, svctl, monkeypatch):
+    """附加常驻的 musicbox 要照常探活并标出来，而不是报「未启用（按需未启动）」。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    monkeypatch.setitem(webui.CONF, "musicbox_url", "http://mb.test")
+    monkeypatch.setitem(webui.CONF, "lx_url", "http://lx.test")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "mb.test":
+            return httpx.Response(200, json={"ok": True, "service": "musicbox"})
+        return httpx.Response(200, json={"ok": True})
+
+    _mock_http(handler)
+    with authed_client() as client:
+        rj = client.get("/api/status").json()
+    assert rj["current_provider"] == "lxmusic"
+    svc = rj["services"]["musicbox"]
+    assert svc["reachable"] is True and svc["aux"] is True
+    assert "附加常驻" in svc["note"]
+
+
+def test_ensure_netease_aux_starts_musicbox(env_file, svctl, monkeypatch):
+    """保活原语（_lifespan 里约每分钟调用一次，掉线/被停后自动拉起）。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    actions = webui.ensure_netease_aux()
+    assert ("start", "musicbox") in svctl.calls
+    assert actions and actions[0]["aux"] is True and actions[0]["ok"] is True
+    # 已在跑时 supervisorctl 报 already started，也算成功（幂等）
+    monkeypatch.setattr(webui, "supervisorctl",
+                        lambda *a, timeout=20.0: (1, "musicbox: ERROR (already started)"))
+    assert webui.ensure_netease_aux()[0]["ok"] is True
+
+
+def test_switch_back_to_musicbox_reuses_aux_process(env_file, monkeypatch):
+    """从洛雪切回网易云：音乐盒作为附加音源本来就在跑，already started 不算失败。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    calls: list[tuple] = []
+
+    def fake(*args, timeout=20.0):
+        calls.append(args)
+        if args == ("start", "musicbox"):
+            return 1, "musicbox: ERROR (already started)"
+        return 0, f"{args[0]}ed {args[1]}"
+
+    monkeypatch.setattr(webui, "supervisorctl", fake)
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "true",
+            "FNMUSIC_LX_ENABLED": "false",
+        }})
+        assert r.status_code == 200
+        actions = r.json()["actions"]
+    assert ("stop", "lxmusic") in calls and ("start", "musicbox") in calls
+    assert ("stop", "musicbox") not in calls
+    assert all(a["ok"] for a in actions if a["kind"] == "process")
+
+
+def test_preview_musicbox_while_aux_running(env_file, monkeypatch):
+    """附加保活期间点音乐盒卡片（扫码/试听）：already started 不是失败，照常进预览倒计时。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    calls: list[tuple] = []
+
+    def fake(*args, timeout=20.0):
+        calls.append(args)
+        if args == ("start", "musicbox"):
+            return 1, "musicbox: ERROR (already started)"
+        return 0, f"{args[0]}ed {args[1]}"
+
+    monkeypatch.setattr(webui, "supervisorctl", fake)
+    _preview_http()
+    with authed_client() as client:
+        r = client.post("/api/preview", json={"provider": "musicbox"})
+    assert r.status_code == 200 and r.json()["preview"] is True
+    assert "musicbox" in webui._preview_until
+    # 进了预览表 ⇒ 到期前关掉账号歌单开关也不会把它停掉（preview_seconds_left 守卫）
+    webui.release_netease_aux({**webui.read_env(),
+                               "FNMUSIC_NETEASE_MY_PLAYLISTS": "false"})
+    assert ("stop", "musicbox") not in calls
+
+

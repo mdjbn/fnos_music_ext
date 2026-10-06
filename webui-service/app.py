@@ -173,17 +173,25 @@ def supervisor_status() -> dict[str, dict]:
     return result
 
 
-def switch_provider_process(old: str, new: str) -> list[dict]:
-    """切源进程：先停旧再起新；失败逐项记录，不抛出。"""
+def switch_provider_process(old: str, new: str, values: dict[str, str] | None = None) -> list[dict]:
+    """切源进程：先停旧再起新；失败逐项记录，不抛出。
+
+    「附加音源」例外：账号歌单开关打开时 musicbox 在洛雪/网盘音源下也要常驻，
+    它不是被切走的旧音源，切走时不能停。
+    """
     actions: list[dict] = []
-    if old and old != new:
+    keep_aux = netease_aux_needed(values or read_env())
+    if old and old != new and not (old == NETEASE_AUX_PROGRAM and keep_aux):
         code, out = supervisorctl("stop", old)
         actions.append({"kind": "process", "program": old, "op": "stop",
                         "ok": code == 0, "error": "" if code == 0 else out})
     if new:
         code, out = supervisorctl("start", new)
+        # 附加常驻的 musicbox 可能已经在跑：切回网易云音源时 supervisorctl 报
+        # already started，这不算失败（否则界面报「启动失败」但服务其实是好的）
+        ok = _aux_ok(code, out, "already started")
         actions.append({"kind": "process", "program": new, "op": "start",
-                        "ok": code == 0, "error": "" if code == 0 else out})
+                        "ok": ok, "error": "" if ok else out})
     return actions
 
 
@@ -197,6 +205,49 @@ _preview_until: dict[str, float] = {}
 
 PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
 PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
+
+# 「音乐页显示网易账号歌单」同时是**附加音源开关**：洛雪/网盘音源下也把音乐盒进程
+# 常驻，否则账号歌单没人去拉（音乐盒本身是停的）。关掉即回收这份内存。
+NETEASE_AUX_KEY = "FNMUSIC_NETEASE_MY_PLAYLISTS"
+NETEASE_AUX_PROGRAM = "musicbox"
+
+
+def netease_aux_needed(values: dict[str, str]) -> bool:
+    """账号歌单开关打开、且当前音源不是音乐盒 ⇒ 需要把音乐盒当附加进程常驻。"""
+    if str(values.get(NETEASE_AUX_KEY, "false")).strip().lower() not in ("true", "1", "yes"):
+        return False
+    return current_provider(values) not in ("", NETEASE_AUX_PROGRAM)
+
+
+def _aux_ok(code: int, out: str, *benign: str) -> bool:
+    """supervisorctl 的无害提示（already started / not running）也算成功。"""
+    return code == 0 or any(word in out.lower() for word in benign)
+
+
+def ensure_netease_aux(values: dict[str, str] | None = None) -> list[dict]:
+    """按需保活 musicbox（幂等）：已在跑时 supervisorctl 会报 already started。"""
+    values = values or read_env()
+    if not netease_aux_needed(values):
+        return []
+    code, out = supervisorctl("start", NETEASE_AUX_PROGRAM)
+    ok = _aux_ok(code, out, "already started")
+    if not ok:
+        logger.warning("附加音源保活失败 musicbox: %s", out)
+    return [{"kind": "process", "program": NETEASE_AUX_PROGRAM, "op": "start",
+             "ok": ok, "error": "" if ok else out, "aux": True}]
+
+
+def release_netease_aux(values: dict[str, str] | None = None) -> list[dict]:
+    """释放附加进程（开关关掉时回收内存）：预览中或本身是当前音源则不动。"""
+    values = values or read_env()
+    if netease_aux_needed(values) or current_provider(values) == NETEASE_AUX_PROGRAM:
+        return []
+    if preview_seconds_left(NETEASE_AUX_PROGRAM) > 0:
+        return []
+    code, out = supervisorctl("stop", NETEASE_AUX_PROGRAM)
+    ok = _aux_ok(code, out, "not running")
+    return [{"kind": "process", "program": NETEASE_AUX_PROGRAM, "op": "stop",
+             "ok": ok, "error": "" if ok else out, "aux": True}]
 
 
 def preview_seconds_left(provider: str) -> float:
@@ -216,9 +267,12 @@ def preview_reap() -> list[str]:
     下一轮 reaper 会重试——否则预览进程漏停后常驻，无人再管。
     """
     stopped: list[str] = []
-    enabled = current_provider(read_env())
+    values = read_env()
+    enabled = current_provider(values)
+    aux = netease_aux_needed(values)
     for provider, deadline in list(_preview_until.items()):
-        if provider == enabled:
+        if provider == enabled or (aux and provider == NETEASE_AUX_PROGRAM):
+            # 转正，或已被「附加音源保活」接管：只移出预览表，进程留着常驻
             _preview_until.pop(provider, None)
         elif deadline <= time.monotonic():
             code, out = supervisorctl("stop", PROVIDER_PROGRAM[provider])
@@ -233,10 +287,12 @@ def preview_reap() -> list[str]:
 
 def preview_reconcile_after_save() -> list[dict]:
     """保存成功后的收尾：预览转正的进程保留，其余预览进程立即停止。"""
-    enabled = current_provider(read_env())
+    values = read_env()
+    enabled = current_provider(values)
+    aux = netease_aux_needed(values)
     actions: list[dict] = []
     for provider in list(_preview_until):
-        if provider == enabled:
+        if provider == enabled or (aux and provider == NETEASE_AUX_PROGRAM):
             _preview_until.pop(provider, None)
             continue
         _preview_until.pop(provider, None)
@@ -312,12 +368,16 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     async def _preview_reaper():
+        ticks = 0
         while True:
             await asyncio.sleep(15.0)
             try:
+                ticks += 1
+                if ticks % 4 == 1:  # 约每分钟保活一次附加音源（掉线/被停后自动拉起）
+                    ensure_netease_aux()
                 preview_reap()
             except Exception:  # noqa: BLE001
-                logger.exception("预览清退循环异常")
+                logger.exception("预览清退/保活循环异常")
     reaper = asyncio.create_task(_preview_reaper())
     try:
         yield
@@ -390,13 +450,19 @@ async def api_status(request: Request):
     provider = current_provider(values)
     processes = supervisor_status()
     services: dict[str, dict] = {}
+    aux = netease_aux_needed(values)
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
-        if name in PROVIDERS and name != provider:
+        # 附加音源（账号歌单）在洛雪/网盘音源下也常驻，照样探活
+        if name in PROVIDERS and name != provider and not (name == NETEASE_AUX_PROGRAM and aux):
             services[name] = {"reachable": False, "note": "未启用（按需未启动）"}
             continue
         ok, data = await _fetch_json(request, f"{base}/healthz")
-        services[name] = {"reachable": ok, "detail": data if ok else data.get("error", "")}
+        entry = {"reachable": ok, "detail": data if ok else data.get("error", "")}
+        if name == NETEASE_AUX_PROGRAM and aux:
+            entry["aux"] = True
+            entry["note"] = "附加常驻（音乐页显示网易账号歌单）"
+        services[name] = entry
     lx_source = None
     if provider == "lxmusic":
         ok, data = await _fetch_json(request, f"{CONF['lx_url']}/api/v1/source")
@@ -509,7 +575,8 @@ async def api_preview(body: PreviewBody, request: Request):
         preview_renew(provider)
         return {"ok": True, "preview": True, "seconds_left": preview_seconds_left(provider)}
     code, out = supervisorctl("start", PROVIDER_PROGRAM[provider])
-    if code != 0:
+    if not _aux_ok(code, out, "already started"):
+        # 已在跑（例如账号歌单开关把 musicbox 保活成附加音源）不算失败，继续探活并记预览
         return JSONResponse(content={"ok": False, "error": out or "supervisorctl start 失败"}, status_code=500)
     client = get_http(request)
     for _ in range(60):  # 等待服务真正可用（healthz），最长约 30s
@@ -563,9 +630,14 @@ async def api_config_put(body: ConfigBody, request: Request):
     new_provider = current_provider(after)
     actions: list[dict] = []
 
-    # 音源切换（先停旧再起新）
+    # 音源切换（先停旧再起新；账号歌单开关打开时 musicbox 作为附加音源保活）
     if old_provider != new_provider:
-        actions.extend(switch_provider_process(old_provider, new_provider))
+        actions.extend(switch_provider_process(old_provider, new_provider, after))
+    # 附加音源保活/释放：开关在洛雪/网盘音源下需要 musicbox 常驻，关掉则回收
+    if netease_aux_needed(after):
+        actions.extend(ensure_netease_aux(after))
+    elif netease_aux_needed(before):
+        actions.extend(release_netease_aux(after))
     # lx 换源激活：热切换 SOURCE_MANAGER（进程刚被拉起时 state.json 仍是旧源，必须显式激活）
     if new_provider == "lxmusic" and lx_url_changed:
         client = get_http(request)

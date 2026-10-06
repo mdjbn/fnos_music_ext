@@ -729,10 +729,23 @@ def _lx_netease_guid(guid: str) -> str:
     return "online:netease:" + str(guid or "").split(":")[-1]
 
 
+def _netease_playlists_on() -> bool:
+    """网易云歌单（账号/频道）数据是否可取。
+
+    音乐盒进程按「音源三选一」只在该音源下运行；「音乐页显示网易账号歌单」开关打开时
+    WebUI 会让它作为**附加音源**在洛雪/网盘音源下也常驻，所以该开关也算可用——否则
+    洛雪音源下账号/频道歌单永远取不到，连缓存的曲目都会因源不可用而播不了。
+    """
+    return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_my_playlists"))
+
+
 def _source_enabled(guid: str) -> bool:
     source = source_from_online_guid(guid)
     # 跨音源兜底先判：洛雪关、网易云开时 wy 曲目仍可播（见 _lx_netease_fallback）
     if source == "lx" and _lx_netease_fallback(guid):
+        return True
+    # 账号歌单开关打开时，网易云歌单在洛雪/网盘音源下也可用（WebUI 保活音乐盒进程）
+    if source == "netease" and _netease_playlists_on():
         return True
     if not CONF.get({"netease": "netease_enabled", "lx": "lx_enabled"}.get(source, "musicdl_enabled")):
         return False
@@ -3404,11 +3417,13 @@ async def lifespan(fastapi_app: FastAPI):
         fastapi_app.state.cdn_client = _new_cdn_client()
         created_cdn = True
 
-    # W6：频道歌单缓存定时刷新（同 G，仅在真实服务环境 + 网易云启用时启动）。
+    # W6：频道歌单缓存定时刷新（同 G，仅在真实服务环境 + 网易云歌单可用时启动）。
+    # 「可用」含账号歌单开关打开的情况：此时 WebUI 会把音乐盒保活在洛雪/网盘音源下，
+    # 缓存刷新与登录态巡检都该照常跑（否则洛雪音源下歌单永远不刷新、掉线也不提醒）。
     stop_event = asyncio.Event()
     refresh_task: asyncio.Task | None = None
     auth_task: asyncio.Task | None = None
-    if _background_jobs_enabled() and CONF.get("netease_enabled"):
+    if _background_jobs_enabled() and _netease_playlists_on():
         refresh_task = asyncio.create_task(_playlist_refresh_loop(fastapi_app, stop_event))
         # W13：登录态巡检（掉线 / VIP 临期 → PushPlus 提醒），与 G 的 lifespan 一致。
         # pushplus.send(None, ...) 内部会自建 httpx 客户端（proxy/pushplus.py:263），
@@ -3678,9 +3693,9 @@ async def ext_playlists_preview():
             "track_count": 0,
         })
     channel_recs: list[dict] = []
-    # 与歌单列表同一门控：当前音源不是网易云时不列网易云频道歌单（预览要如实反映
-    # 实际注入结果，否则用户会以为它们本该出现）
-    if CONF.get("netease_enabled"):
+    # 与歌单列表同一门控：账号歌单开关打开时洛雪/网盘音源下音乐盒仍常驻，
+    # 频道歌单照常可取；开关关掉且音源不是网易云时不列（预览要如实反映实际注入结果）
+    if _netease_playlists_on():
         try:
             channel_recs, _keep, _complete = await _channel_playlist_records(client)
         except Exception as exc:  # noqa: BLE001 - 预览接口不该 500
@@ -3721,8 +3736,8 @@ async def ext_playlists_preview():
 @app.post("/_ext/playlists/warm")
 async def ext_playlists_warm():
     """手动预热按钮（W6）：刷新当前口径下所有频道歌单的曲目缓存。"""
-    if not CONF.get("netease_enabled"):
-        # 频道歌单只能由 musicbox 提供，当前音源不是网易云时没有可预热的目标
+    if not _netease_playlists_on():
+        # 频道歌单只能由 musicbox 提供，且只有账号歌单开关打开时它才在洛雪/网盘下常驻
         return {"ok": True, "data": {"started": False, "reason": "netease_disabled"}}
     client = get_musicbox_client(app)
     try:
@@ -8079,16 +8094,17 @@ async def playlist_list(request: Request):
         return auth_resp or JSONResponse(content=envelope, headers=headers)
 
     kinds = _recommend_injectable_kinds(user_guid)
-    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见
-    nm_on = bool(CONF.get("netease_my_playlists")) and bool(CONF.get("netease_enabled"))
-    # W6 频道歌单（榜/分类/我的/新碟/电台）：SWR 内存缓存，上游不可用时返回空表
-    # 网易云频道/账号歌单只能由 musicbox 服务提供。当前音源是洛雪/网盘时 musicbox
-    # 未启动，硬拉只会白等一轮（用户报「用洛雪音源时网易云歌单一直加载不出来」）；
-    # 此时直接不注入，切回网易云音源后自然出现。
+    # 网易账号歌单：实例级内容（同热门推荐），shared 会话同样可见。开关打开即注入——
+    # 它同时是「附加音源」开关：洛雪/网盘音源下 WebUI 会把音乐盒进程保活（见
+    # _netease_playlists_on），所以不再要求当前音源就是网易云。
+    nm_on = bool(CONF.get("netease_my_playlists"))
+    # W6 频道歌单（榜/分类/我的/新碟/电台）：SWR 内存缓存，上游不可用时返回空表。
+    # 数据由 musicbox 提供：音源不是它且账号歌单开关关着时它没在跑，硬拉只会白等一轮
+    # （用户报「用洛雪音源时网易云歌单一直加载不出来」）；开关打开时它被保活，照常注入。
     channel_recs: list[dict] = []
     keep: set[str] = set()
     complete = False
-    if CONF.get("netease_enabled"):
+    if _netease_playlists_on():
         try:
             channel_recs, keep, complete = await _channel_playlist_records(get_musicbox_client(request.app))
             if complete:
