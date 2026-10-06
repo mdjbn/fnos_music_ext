@@ -163,3 +163,21 @@ def test_channel_keys_are_single_source_of_truth():
     assert admin_ui._ORDER_KEYS == cs._ORDER_KEYS
     assert cs.coerce("netease_channel_order", "mine,daily") == "mine,daily"   # 顺序原样保留
 
+
+def test_channel_aliases_are_accepted_and_canonicalized():
+    """旧文案里的 hot/my/newalbums/radio 归一成 toplist/mine/newalbum/fm。"""
+    assert cs.coerce("netease_channel_order", "hot,radio,daily,my") == "toplist,fm,daily,mine"
+    assert cs.coerce("netease_channels", "my,hot") == "mine,toplist"
+    assert cs.CHANNEL_ALIASES == {"hot": "toplist", "my": "mine",
+                                  "newalbums": "newalbum", "radio": "fm"}
+
+
+def test_channel_order_help_lists_real_keys():
+    """回归：音源页那段说明写的是 G 时代的 key（hot/my/newalbums/radio），
+    而运行时只认 mine/nrec/toplist/category/newalbum/fm ⇒ 照抄的配置会被静默丢掉。"""
+    help_text = cs.FIELD_UI["netease_channel_order"]["help"]
+    for key in ("daily", "localdaily", "mine", "nrec", "toplist", "category", "newalbum", "fm"):
+        assert key in help_text, key
+    assert "hot（热门）" not in help_text
+    assert "旧名 hot/my/newalbums/radio 也认" in help_text
+

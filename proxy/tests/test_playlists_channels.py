@@ -379,6 +379,19 @@ async def test_channel_records_cache_hit_and_stale_refresh(monkeypatch):
 # ===========================================================================
 
 
+def test_channel_order_accepts_legacy_aliases(monkeypatch):
+    """旧说明文案写的是 hot/my/newalbums/radio（G 时代叫法）；运行时归一成现名，
+    照旧文案配好的人不该被静默丢掉顺序。"""
+    from proxy import config_schema as cs
+
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "hot,my,daily")
+    order = pl.channel_order()
+    assert order[0] == "localdaily"                  # 没写 localdaily ⇒ 仍插到最前
+    assert order[1:4] == ("toplist", "mine", "daily")  # hot→toplist、my→mine
+    assert pl.CHANNEL_ALIASES == cs.CHANNEL_ALIASES == {
+        "hot": "toplist", "my": "mine", "newalbums": "newalbum", "radio": "fm"}
+
+
 def test_channel_order_custom_and_fallback(monkeypatch):
     # 自定义顺序：用户给的顺序原样生效，漏掉的按默认序追加
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNEL_ORDER", "toplist, mine, daily")

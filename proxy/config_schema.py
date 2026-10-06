@@ -131,13 +131,21 @@ def _as_time_of_day(v: Any) -> str:
 CHANNEL_KEYS = ("mine", "nrec", "toplist", "category", "newalbum", "fm")
 # 大类顺序额外允许 daily / localdaily（它们不在勾选框里，由各自独立开关控制）
 _ORDER_KEYS = ("daily", "localdaily") + CHANNEL_KEYS
+# 历史别名：旧说明文案把这几项写成 hot/my/newalbums/radio（G 时代的叫法），用户照抄进
+# 配置会被静默丢掉顺序。这里统一归一成现名——认下来，但不写回旧名。
+CHANNEL_ALIASES = {"hot": "toplist", "my": "mine", "newalbums": "newalbum", "radio": "fm"}
+
+
+def _canon_channel(key: str) -> str:
+    key = (key or "").strip().lower()
+    return CHANNEL_ALIASES.get(key, key)
 
 
 def _as_channels(v: Any) -> str:
     """口径勾选列表：逗号分隔，只接受已知 key，按固定顺序输出。"""
     picked: list[str] = []
     for part in str(v or "").replace(";", ",").split(","):
-        key = part.strip().lower()
+        key = _canon_channel(part)
         if key and key in CHANNEL_KEYS and key not in picked:
             picked.append(key)
     if not picked:
@@ -152,7 +160,7 @@ def _as_channel_order(v: Any) -> str:
     """
     picked: list[str] = []
     for part in str(v or "").replace(";", ",").split(","):
-        key = part.strip().lower()
+        key = _canon_channel(part)
         if key and key in _ORDER_KEYS and key not in picked:
             picked.append(key)
     if not picked:
@@ -207,7 +215,7 @@ FIELDS: dict[str, dict] = {
     "netease_channels": {"env": "FNMUSIC_NETEASE_CHANNELS", "label": 'netease_channels', "help": '', "kind": "channels", "group": '更多口径歌单 / 账户歌单', "default": 'mine,toplist,category'},
     "netease_channel_limit": {"env": "FNMUSIC_NETEASE_CHANNEL_LIMIT", "label": '每口径注入上限', "help": '1–50。排行榜上游有 63 个，不限就会把你自己的本地歌单淹掉', "kind": "int", "group": '更多口径歌单 / 账户歌单', "default": '8', "min": 1, "max": 50},
     "netease_category": {"env": "FNMUSIC_NETEASE_CATEGORY", "label": '分类歌单的分类', "help": '华语 / 欧美 / 日语 / 韩语 / 粤语 / 流行 / 摇滚 / 民谣 / 电子 ……', "kind": "text", "group": '更多口径歌单 / 账户歌单', "default": '华语', "max_len": 32},
-    "netease_channel_order": {"env": "FNMUSIC_NETEASE_CHANNEL_ORDER", "label": '歌单大类顺序', "help": '飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值： daily(网易云每日推荐) / localdaily(本地每日推荐) / mine(我的歌单) / nrec(推荐歌单) / toplist(排行榜) / category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后', "kind": "channel_order", "group": '更多口径歌单 / 账户歌单', "default": 'localdaily,daily,mine,nrec,toplist,category,newalbum,fm'},
+    "netease_channel_order": {"env": "FNMUSIC_NETEASE_CHANNEL_ORDER", "label": '歌单大类顺序', "help": '飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值： daily(每日推荐) / localdaily(本地每日推荐) / mine(我的歌单) / nrec(推荐歌单) / toplist(排行榜) / category(分类歌单) / newalbum(新碟上架) / fm(私人FM)。没列出来的排最后；旧名 hot/my/newalbums/radio 也认', "kind": "channel_order", "group": '更多口径歌单 / 账户歌单', "default": 'localdaily,daily,mine,nrec,toplist,category,newalbum,fm'},
     "netease_playlist_order": {"env": "FNMUSIC_NETEASE_PLAYLIST_ORDER", "label": 'netease_playlist_order', "help": '', "kind": "playlist_order", "group": '更多口径歌单 / 账户歌单', "default": ''},
     "playlist_track_limit": {"env": "FNMUSIC_PLAYLIST_TRACK_LIMIT", "label": '歌单曲目上限', "help": '1–1000，点开歌单时最多解析多少首（越多越慢）', "kind": "int", "group": '更多口径歌单 / 账户歌单', "default": '300', "min": 1, "max": 1000},
     "playlist_cache_ttl_h": {"env": "FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "label": '歌单缓存有效期（小时）', "help": '缓存期内点开歌单直接读本地（秒开）；超期后先返回缓存、后台自动刷新，你看到的永远是上一次的结果', "kind": "int", "group": '歌单曲目缓存（v2.6）：打开秒开', "default": '6', "min": 1, "max": 168},
@@ -324,16 +332,19 @@ FIELD_UI: dict[str, dict] = {
                               "默认关闭；需要登录态可用"},
     # ---- 音乐源 · 歌单与频道 ----
     "netease_channels": {"page": "source", "group": "歌单与频道", "label": "频道歌单",
-                         "help": "要注入飞牛歌单列表的网易云频道（榜/分类/我的/新碟/电台），"
-                                 "逗号分隔；留空 = 全用默认"},
+                         "help": "要注入飞牛歌单列表的网易云频道，逗号分隔；留空 = 全用默认。"
+                                 "mine 我的歌单 / nrec 推荐歌单 / toplist 排行榜 / category 分类歌单 / "
+                                 "newalbum 新碟上架 / fm 私人FM"},
     "netease_channel_limit": {"page": "source", "group": "歌单与频道", "label": "频道歌单数量上限",
                               "help": "1–50，每个频道最多注入多少张"},
     "netease_category": {"page": "source", "group": "歌单与频道", "label": "分类歌单的分类",
                          "help": "华语 / 欧美 / 日语 / 韩语 / 粤语 / 流行 / 摇滚 / 民谣 / 电子 ……"},
     "netease_channel_order": {"page": "source", "group": "歌单与频道", "label": "歌单大类顺序",
-                              "help": "飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值：daily（网易云每日推荐）"
-                                      "/ localdaily（本地每日推荐）/ hot（热门）/ category（分类）/ "
-                                      "my（我的）/ newalbums（新碟）/ radio（电台）"},
+                              "help": "飞牛歌单列表里各大类的前后顺序，逗号分隔。可用值（写 key）："
+                                      "daily 每日推荐 / localdaily 本地每日推荐 / mine 我的歌单 / "
+                                      "nrec 推荐歌单 / toplist 排行榜 / category 分类歌单 / "
+                                      "newalbum 新碟上架 / fm 私人FM。没列出来的排最后；"
+                                      "旧名 hot/my/newalbums/radio 也认（等同 toplist/mine/newalbum/fm）"},
     "netease_playlist_order": {"page": "source", "group": "歌单与频道", "label": "歌单展示顺序",
                                "help": "按 guid 精确排序，逗号分隔（一般不用手填，页面上的拖拽会写这个值）"},
     "playlist_track_limit": {"page": "source", "group": "歌单与频道", "label": "歌单曲目上限",

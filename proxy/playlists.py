@@ -68,6 +68,10 @@ DEFAULT_CHANNELS = "mine,toplist,category"
 # v2.9 新增 localdaily（本地每日推荐，由 recommend.py 负责内容，这里只管排序）。
 DEFAULT_CHANNEL_ORDER = "localdaily,daily,mine,nrec,toplist,category,newalbum,fm"
 
+# 旧说明文案把这几项写成 hot/my/newalbums/radio（G 时代的叫法）。归一成现名，免得照旧文案
+# 配好的人被静默丢掉顺序。与 proxy/config_schema.py 的 CHANNEL_ALIASES 保持一致（测试钉死）。
+CHANNEL_ALIASES = {"hot": "toplist", "my": "mine", "newalbums": "newalbum", "radio": "fm"}
+
 _PREFIX_BY_CHANNEL = {"mine": "", "nrec": "推荐", "toplist": "榜",
                       "category": "", "newalbum": "新碟", "fm": "电台"}
 
@@ -88,7 +92,7 @@ def channel_order() -> tuple[str, ...]:
     daily_listed = False
     if raw:
         for part in raw.replace(";", ",").split(","):
-            key = part.strip().lower()
+            key = CHANNEL_ALIASES.get(part.strip().lower(), part.strip().lower())
             if key == "localdaily":
                 daily_listed = True
             if key in CHANNELS and key not in ordered:
