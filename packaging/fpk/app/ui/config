@@ -2,12 +2,12 @@
     ".url": {
         "fnmusic-ext.main": {
             "title": "fnMusic 扩展管理",
-            "desc": "音源切换 / 扫码登录 / 歌单同步 / 收藏归档 / 日志诊断",
+            "desc": "音源切换 / 扫码登录 / 播放与推荐 · 扩展设置见页面内「扩展设置」",
             "icon": "images/icon_{0}.png",
             "type": "iframe",
             "protocol": "http",
             "port": "",
-            "url": "/app/fnmusic-ext/admin/",
+            "url": "/app/fnmusic-ext/",
             "allUsers": false,
             "gatewaySocket": "fnmusic-ext.sock",
             "gatewayPrefix": "/app/fnmusic-ext"

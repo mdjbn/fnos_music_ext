@@ -25,6 +25,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))  # /repo：复用 proxy/env_merge
+from proxy.config_schema import FIELDS as EXT_FIELDS, GROUP_ORDER as EXT_GROUPS, coerce as ext_coerce  # noqa: E402
 from proxy.env_merge import (  # noqa: E402
     parse_env_file,
     preserve_user_comments,
@@ -417,6 +418,61 @@ async def api_config():
         "schema": SCHEMA,
         "env_path": str(ENV_PATH),
     }
+
+
+EXT_MASK = "••••••••"
+
+
+def _ext_values(env: dict) -> dict:
+    """扩展设置当前值：secret 已配置时只回掩码。"""
+    out = {}
+    for field, meta in EXT_FIELDS.items():
+        raw = str(env.get(meta["env"], meta.get("default", "")) or "")
+        out[field] = EXT_MASK if meta.get("secret") and raw.strip() else raw
+    return out
+
+
+@app.get("/api/extended")
+async def api_extended():
+    """扩展设置页的字段表 + 当前值（校验规则与控制台共用 proxy/config_schema.py）。"""
+    env = read_env()
+    values = _ext_values(env)
+    fields = []
+    for field, meta in EXT_FIELDS.items():
+        item = {"field": field, "value": values[field], **meta}
+        fields.append(item)
+    return {"ok": True, "groups": EXT_GROUPS, "fields": fields, "env_path": str(ENV_PATH)}
+
+
+class ExtendedBody(BaseModel):
+    values: dict
+
+
+@app.put("/api/extended")
+async def api_extended_put(body: ExtendedBody):
+    """只写本次提交的字段：没提交的保持原值；secret 留空或回传掩码都视为「不修改」。"""
+    before = read_env()
+    updates: dict[str, str] = {}
+    errors: list[str] = []
+    for field, raw in (body.values or {}).items():
+        meta = EXT_FIELDS.get(field)
+        if meta is None:
+            errors.append(f"{field}: 未知配置项")
+            continue
+        current = str(before.get(meta["env"], meta.get("default", "")) or "")
+        text = "" if raw is None else str(raw).strip()
+        if meta.get("secret") and text in ("", EXT_MASK):
+            continue
+        if not meta.get("secret") and text == current:
+            continue
+        try:
+            updates[meta["env"]] = ext_coerce(field, text)
+        except ValueError as exc:
+            errors.append(f"{meta.get('label') or field}：{exc}")
+    if errors:
+        return JSONResponse(content={"ok": False, "error": "；".join(errors[:6])}, status_code=400)
+    changed = write_env(updates) if updates else []
+    return {"ok": True, "changed": changed, "values": _ext_values(read_env())}
 
 
 class ConfigBody(BaseModel):

@@ -317,3 +317,14 @@ def test_dockerfile_copies_proxy_modules_imported_by_services():
                 mod = f"proxy/{m.group(1)}.py"
                 assert mod in copied, f"{service_dir}/{py.name} import {mod}，Dockerfile 需 COPY 进镜像"
                 assert f"!{mod}" in ignore, f"{mod} 被 .dockerignore 排除，构建上下文拿不到"
+
+    # 传递依赖：被 COPY 进镜像的 proxy 模块，它自己 import 的 proxy 模块也必须一起进镜像
+    # （回归：config_schema 依赖 download.validate_dir，漏拷会让 webui 一 import 就崩）
+    copied_files = {tok.split("proxy/", 1)[1] for tok in copied.split()
+                    if tok.startswith("proxy/") and tok.endswith(".py")}
+    for name in sorted(copied_files):
+        src = (REPO_ROOT / "proxy" / name).read_text(encoding="utf-8")
+        for m in re.finditer(r"^\s*from \. import ([A-Za-z_][\w]*)", src, re.M):
+            dep = f"{m.group(1)}.py"
+            assert dep in copied_files, f"proxy/{name} import proxy/{dep}，Dockerfile 需一并 COPY"
+            assert f"!proxy/{dep}" in ignore, f"proxy/{dep} 被 .dockerignore 排除"

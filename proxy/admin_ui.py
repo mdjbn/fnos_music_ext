@@ -40,6 +40,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from starlette.middleware.base import BaseHTTPMiddleware
 
 try:
+    from . import config_schema
     from . import download
     from . import env_merge
     from . import loghouse
@@ -47,12 +48,28 @@ try:
     from . import pushplus
     from .version import get_version
 except ImportError:  # uvicorn --app-dir proxy
+    import config_schema  # type: ignore
     import download  # type: ignore
     import env_merge  # type: ignore
     import loghouse  # type: ignore
     import netease_auth  # type: ignore
     import pushplus  # type: ignore
     from version import get_version  # type: ignore
+
+# 校验规则统一由 proxy/config_schema.py 提供（控制台与 A 自带音源页的「扩展设置」共用一份），
+# 这里保留原名字，页面代码与既有测试照常引用。
+_as_bool = config_schema._as_bool
+_int_range = config_schema._int_range
+_in_choices = config_schema._in_choices
+_http_url = config_schema._http_url
+_free_text = config_schema._free_text
+_token = config_schema._token
+_as_library_dir = config_schema._as_library_dir
+_as_path = config_schema._as_path
+_as_time_of_day = config_schema._as_time_of_day
+_as_channels = config_schema._as_channels
+_as_channel_order = config_schema._as_channel_order
+_as_playlist_order = config_schema._as_playlist_order
 
 logger = logging.getLogger("fnmusic_proxy.admin_ui")
 
@@ -103,177 +120,13 @@ QUALITY_LEVEL_LABELS = (
 TEMPLATES = ("markdown", "html", "txt", "json")
 
 
-def _as_bool(v: Any) -> str:
-    return "true" if str(v).strip().lower() in ("true", "1", "yes", "on") else "false"
-
-
-def _in_choices(*choices: str):
-    def check(v: Any) -> str:
-        s = str(v).strip().lower()
-        if s not in choices:
-            raise ValueError(f"取值必须是 {'/'.join(choices)} 之一，收到 {s!r}")
-        return s
-
-    return check
-
-
-def _int_range(lo: int, hi: int):
-    def check(v: Any) -> str:
-        s = str(v).strip()
-        if not re.fullmatch(r"\d+", s):
-            raise ValueError(f"必须是 {lo}..{hi} 的整数，收到 {v!r}")
-        n = int(s)
-        if not lo <= n <= hi:
-            raise ValueError(f"必须在 {lo}..{hi} 之间，收到 {n}")
-        return str(n)
-
-    return check
-
-
-def _http_url(v: Any) -> str:
-    s = str(v).strip()
-    if not s:
-        return ""
-    if not re.match(r"^https?://[^\s]+$", s):
-        raise ValueError(f"必须以 http:// 或 https:// 开头，收到 {s!r}")
-    return s
-
-
-def _free_text(maxlen: int = 200):
-    def check(v: Any) -> str:
-        s = str(v).strip()
-        if len(s) > maxlen:
-            raise ValueError(f"长度不能超过 {maxlen}")
-        # 这些值会写进单引号包裹的 .env，dotenv_escape 已处理引号；
-        # 这里再挡掉换行与控制字符，避免破坏 .env 的行结构
-        if any(ord(c) < 32 for c in s):
-            raise ValueError("不能包含换行或控制字符")
-        return s
-
-    return check
-
-
 # 可在网页上勾选的歌单口径。「每日推荐」不在此列——它有独立开关 daily_enabled，
 # 重复放一个勾只会让人以为两个开关各管一半。
 CHANNEL_KEYS = ("mine", "nrec", "toplist", "category", "newalbum", "fm")
 
 
-def _as_channels(v: Any) -> str:
-    """口径勾选列表：逗号分隔，只接受已知 key，按固定顺序输出。"""
-    picked: list[str] = []
-    for part in str(v or "").replace(";", ",").split(","):
-        key = part.strip().lower()
-        if key and key in CHANNEL_KEYS and key not in picked:
-            picked.append(key)
-    if not picked:
-        raise ValueError("至少勾选一个歌单口径（全不勾等于关掉这个功能）")
-    return ",".join(sorted(picked, key=CHANNEL_KEYS.index))
-
-
 # 大类顺序里额外允许 daily / localdaily（它们不在勾选框里，由各自独立开关控制）
 _ORDER_KEYS = ("daily", "localdaily") + CHANNEL_KEYS
-
-
-def _as_channel_order(v: Any) -> str:
-    """歌单大类顺序：逗号分隔，只接受已知 key，按用户给的顺序原样输出。
-
-    与 _as_channels 不同，这里**不**做规范排序——顺序本身就是用户要配的东西。
-    空值回落到默认全序。
-    """
-    picked: list[str] = []
-    for part in str(v or "").replace(";", ",").split(","):
-        key = part.strip().lower()
-        if key and key in _ORDER_KEYS and key not in picked:
-            picked.append(key)
-    if not picked:
-        return ",".join(_ORDER_KEYS)
-    return ",".join(picked)
-
-
-def _as_playlist_order(v: Any) -> str:
-    """手动歌单顺序（v2.5）：逗号分隔 token。
-
-    token 只允许 ``daily``（每日推荐的稳定别名，其真实 guid 含日期与用户 id）
-    或 ``online:playlist:...`` 形式的完整 guid。空 = 不启用手动顺序（按大类排）。
-    值来自管理页「歌单顺序」卡片，由前端按当前清单拼好，这里只做防注入校验。
-    """
-    tokens: list[str] = []
-    for part in str(v or "").replace(";", ",").split(","):
-        t = part.strip()
-        if not t:
-            continue
-        if t != "daily" and not re.fullmatch(r"online:playlist:[A-Za-z0-9_.:\-]+", t):
-            raise ValueError(f"顺序项必须是 daily 或 online:playlist:… 的 guid，收到 {t[:60]!r}")
-        if t not in tokens:
-            tokens.append(t)
-    return ",".join(tokens)
-
-
-def _as_time_of_day(v: Any) -> str:
-    """每日定时刷新时间：HH:MM（24h）或留空关闭。"""
-    s = str(v or "").strip()
-    if not s:
-        return ""
-    m = re.fullmatch(r"(\d{1,2}):(\d{1,2})", s)
-    if not m:
-        raise ValueError(f"时间格式应为 HH:MM（如 04:30），收到 {s!r}")
-    h, mi = int(m.group(1)), int(m.group(2))
-    if h > 23 or mi > 59:
-        raise ValueError(f"时间超出范围（00:00–23:59），收到 {s!r}")
-    return f"{h:02d}:{mi:02d}"
-
-
-def _as_library_dir(v: Any) -> str:
-    """本地曲库目录：留空 = 交给自动探测；填了就必须是**已存在的目录**。
-
-    这里刻意只校验「存在且是目录」，不要求可写——曲库是只读的，要求可写会把
-    飞牛自己的共享目录挡在门外。同时也不接受相对路径（进程工作目录不固定）。
-    """
-    path = str(v or "").strip()
-    if not path:
-        return ""          # 空 = 自动探测
-    if not os.path.isabs(path):
-        raise ValueError("必须填绝对路径（例如 /vol1/1000/music）")
-    if not os.path.isdir(path):
-        raise ValueError("目录不存在：请先在飞牛音乐里确认曲库位置，或到文件管理里复制完整路径")
-    return path
-
-
-def _as_path(v: Any) -> str:
-    """归档目录：必须是已存在的可写绝对路径，且不能是系统目录。
-
-    这里就地把关，而不是等到用户点收藏时才发现路径不对——那时文件可能已经
-    写进错误位置。校验规则与 proxy/download.validate_dir 同源，只此一份。
-    """
-    path = str(v or "").strip()
-    if not path:
-        return ""          # 空 = 关闭自动归档
-
-    # ⚠️ 必须用模块顶部导入好的 download，不能在这里写 `from . import download`：
-    # 管理页常以 `uvicorn --app-dir proxy` 启动，此时 admin_ui 是**顶层模块**、
-    # 没有父包，相对导入必抛 ImportError。真机上这会被外层包成
-    # 「取值非法（attempted relative import with no known parent package）」——
-    # 明明是程序错误，却显示成用户的输入不合法，用户改一万遍路径也过不去。
-    try:
-        ok, why = download.validate_dir(path)
-    except Exception as exc:  # noqa: BLE001 - 我们的错要如实标注，不能赖到用户输入上
-        raise ValueError(f"内部校验出错（非路径问题）: {type(exc).__name__}: {exc}"[:200]) from exc
-    if not ok:
-        raise ValueError(why)
-    return path
-
-
-def _token(v: Any) -> str:
-    s = str(v).strip()
-    if not s:
-        return ""
-    if len(s) < 8:
-        raise ValueError("token 长度异常（少于 8 位），请到 pushplus.plus 个人中心重新复制")
-    if len(s) > 200:
-        raise ValueError("token 过长")
-    if not re.fullmatch(r"[A-Za-z0-9_\-]+", s):
-        raise ValueError("token 只能包含字母、数字、下划线与连字符")
-    return s
 
 
 CONFIG_FIELDS: dict[str, tuple[str, Any, bool]] = {

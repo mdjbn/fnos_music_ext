@@ -546,3 +546,115 @@ window.addEventListener("beforeunload", (ev) => {
   await loadPlatforms(false);  // 页面加载不自动拉起预览进程，等用户点选音源
   setInterval(loadStatus, 15000);
 })();
+
+/* ---------------------------------------------------------- 扩展设置 */
+// 字段表来自 /api/extended（后端用 proxy/config_schema.py：与桌面控制台同一份校验规则），
+// 所以控制台以后新增字段，这里不用改前端就能显示出来。
+function extFieldEl(item) {
+  const wrap = document.createElement("label");
+  wrap.className = "field";
+  const cap = document.createElement("span");
+  cap.textContent = item.label || item.field;
+  wrap.appendChild(cap);
+
+  let input;
+  if (item.kind === "bool") {
+    input = document.createElement("input");
+    input.type = "checkbox";
+    input.checked = String(item.value) === "true";
+  } else if (item.kind === "choices" && (item.choices || []).length) {
+    input = document.createElement("select");
+    input.className = "input";
+    item.choices.forEach((c) => {
+      const opt = document.createElement("option");
+      opt.value = c;
+      opt.textContent = c;
+      input.appendChild(opt);
+    });
+    input.value = item.value || item.choices[0];
+  } else {
+    input = document.createElement("input");
+    input.className = "input";
+    input.type = item.secret ? "password" : (item.kind === "int" ? "number" : "text");
+    if (item.secret) {
+      input.placeholder = "留空表示不修改";
+      input.autocomplete = "new-password";
+    }
+    if (item.kind === "int") {
+      if (item.min != null) input.min = String(item.min);
+      if (item.max != null) input.max = String(item.max);
+    }
+    input.value = item.value == null ? "" : String(item.value);
+  }
+  input.dataset.field = item.field;
+  input.dataset.kind = item.kind;
+  wrap.appendChild(input);
+
+  if (item.help) {
+    const ht = document.createElement("p");
+    ht.className = "hint";
+    ht.innerHTML = item.help;   // 文案来自我们自己的 schema（可信），保留加粗/代码样式
+    wrap.appendChild(ht);
+  }
+  return wrap;
+}
+
+async function loadExtended() {
+  const box = $("#ext-body");
+  if (!box) return;
+  box.className = "muted";
+  box.textContent = "加载中…";
+  try {
+    const data = await api("/api/extended");
+    const values = data.values || {};
+    box.className = "";
+    box.innerHTML = "";
+    (data.groups || []).forEach((group) => {
+      const items = (data.fields || []).filter((f) => f.group === group);
+      if (!items.length) return;
+      const card = document.createElement("div");
+      card.className = "card";
+      const title = document.createElement("div");
+      title.className = "card-title";
+      title.textContent = group;
+      card.appendChild(title);
+      items.forEach((it) => card.appendChild(extFieldEl(it)));
+      box.appendChild(card);
+    });
+    if (!box.children.length) box.textContent = "没有可显示的扩展设置项";
+    void values;
+  } catch (err) {
+    box.className = "muted";
+    box.textContent = "加载失败：" + err.message;
+  }
+}
+
+async function saveExtended() {
+  const box = $("#ext-body");
+  const msg = $("#ext-msg");
+  if (!box || !msg) return;
+  const values = {};
+  $$("#ext-body [data-field]").forEach((el) => {
+    values[el.dataset.field] = el.dataset.kind === "bool" ? (el.checked ? "true" : "false") : el.value;
+  });
+  msg.textContent = "保存中…";
+  try {
+    const data = await api("/api/extended", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ values }),
+    });
+    const n = (data.changed || []).length;
+    msg.textContent = n ? `已保存 ${n} 项，约 2 秒内生效` : "没有需要保存的改动";
+    toast(msg.textContent);
+    await loadExtended();
+  } catch (err) {
+    msg.textContent = "保存失败：" + err.message;
+  }
+}
+
+$$("[data-page]").forEach((btn) => btn.addEventListener("click", () => {
+  if (btn.dataset.page === "extended") void loadExtended();
+}));
+const extSaveBtn = $("#ext-save");
+if (extSaveBtn) extSaveBtn.addEventListener("click", () => void saveExtended());

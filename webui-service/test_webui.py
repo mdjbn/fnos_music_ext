@@ -717,3 +717,68 @@ def test_api_requires_admin(env_file):
         saved = client.put("/api/config", json={"values": {"FNMUSIC_QUALITY_MODE": "smooth"}})
         assert saved.status_code == 200
     assert "FNMUSIC_QUALITY_MODE='smooth'" in env_file.read_text(encoding="utf-8")
+
+
+# ---------------------------------------------------------------- 扩展设置 ---
+
+def test_extended_get_serves_all_console_fields(env_file):
+    """扩展设置页的字段表 = 控制台字段表（同一份 proxy/config_schema.py）。"""
+    from proxy.config_schema import FIELDS
+    with authed_client() as client:
+        r = client.get("/api/extended")
+    assert r.status_code == 200
+    data = r.json()
+    fields = {f["field"]: f for f in data["fields"]}
+    assert set(fields) == set(FIELDS)
+    item = fields["download_on_favorite"]
+    assert item["kind"] == "bool"
+    # .env 里没有该键时回 schema 默认值（与控制台一致），不是空串
+    assert item["value"] == FIELDS["download_on_favorite"]["default"] == "false"
+    for item in data["fields"]:
+        assert item["label"] and item["group"] in data["groups"]
+
+
+def test_extended_put_writes_masks_and_keeps_untouched(env_file):
+    with authed_client() as client:
+        r = client.put("/api/extended", json={"values": {
+            "lx_sync_enabled": "true",
+            "lx_sync_url": "https://host:9528/admin",
+            "lx_sync_password": "pw-123",
+            "lx_sync_writeback": "tracks",
+            "download_on_favorite": "true",
+        }})
+        assert r.status_code == 200, r.text
+        data = r.json()
+        assert "FNMUSIC_LX_SYNC_ENABLED" in data["changed"]
+        # secret 只回掩码，明文不出现在响应里
+        assert data["values"]["lx_sync_password"] == webui.EXT_MASK
+        assert "pw-123" not in str(data)
+        text = env_file.read_text(encoding="utf-8")
+        assert "FNMUSIC_LX_SYNC_PASSWORD" in text and "pw-123" in text
+        assert "FNMUSIC_LX_SYNC_WRITEBACK" in text
+
+        # 回传掩码 / 留空都表示「不修改」
+        r2 = client.put("/api/extended", json={"values": {"lx_sync_password": webui.EXT_MASK}})
+        assert r2.status_code == 200 and r2.json()["changed"] == []
+        r3 = client.put("/api/extended", json={"values": {"lx_sync_password": ""}})
+        assert r3.json()["changed"] == []
+        assert "pw-123" in env_file.read_text(encoding="utf-8")
+
+    # 旧页面自己管的键、用户自定义键都不受扩展保存影响
+    text = env_file.read_text(encoding="utf-8")
+    assert "CUSTOM_KEY='keepme'" in text
+    assert "FNMUSIC_TEE_CACHE_MAX='2'" in text
+
+
+def test_extended_put_rejects_bad_values_without_writing(env_file):
+    with authed_client() as client:
+        bad = client.put("/api/extended", json={"values": {"lx_sync_writeback": "nope"}})
+        assert bad.status_code == 400 and "off/tracks/all" in bad.json()["error"]
+        bad2 = client.put("/api/extended", json={"values": {"daily_limit": "999"}})
+        assert bad2.status_code == 400 and "1..100" in bad2.json()["error"]
+        unknown = client.put("/api/extended", json={"values": {"no_such_field": "1"}})
+        assert unknown.status_code == 400 and "未知配置项" in unknown.json()["error"]
+    # 有错误时一个字段都不许落盘
+    text = env_file.read_text(encoding="utf-8")
+    assert "FNMUSIC_LX_SYNC_WRITEBACK" not in text
+    assert "FNMUSIC_DAILY_LIMIT" not in text
