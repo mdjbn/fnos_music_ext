@@ -297,6 +297,12 @@ def _build_state(list_data: dict) -> "tuple[list, dict, dict]":
     if isinstance(love, list) and love:
         groups.append(("我的收藏（洛雪）", {"id": "love", "name": "我的收藏（洛雪）",
                                        "locationUpdateTime": None, "list": love}))
+    default = list_data.get("defaultList") or []
+    if isinstance(default, list) and default:
+        # 试听列表（LIST_IDS.DEFAULT = 'default'）：洛雪里点了但没加进歌单的临时队列。
+        # 空的时候不挂空壳，免得歌单列表里多一张永远空的卡片。
+        groups.append(("试听列表（洛雪）", {"id": "default", "name": "试听列表（洛雪）",
+                                       "locationUpdateTime": None, "list": default}))
     for pl in list_data.get("userList") or []:
         if isinstance(pl, dict) and isinstance(pl.get("list"), list):
             groups.append((str(pl.get("name") or ""), pl))

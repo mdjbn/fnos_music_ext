@@ -168,6 +168,18 @@ def test_build_state_cards_and_filters():
     assert tracks["online:playlist:lxsync:pl-1"] == [SONG_KW, SONG_KG]   # local 已过滤
 
 
+def test_default_list_is_injected_but_not_when_empty():
+    """试听列表（defaultList，id='default'）也要注入；空的时候不挂空壳卡片。"""
+    cards, tracks, _ = lxsync._build_state({"defaultList": [SONG_KW, SONG_KG],
+                                            "loveList": [], "userList": []})
+    assert [c["name"] for c in cards] == ["试听列表（洛雪）"]
+    assert cards[0]["guid"] == "online:playlist:lxsync:default"
+    assert cards[0]["trackCount"] == 2
+    assert lxsync.lxsync_playlist_id_from_guid(cards[0]["guid"]) == "default"
+    assert tracks[cards[0]["guid"]] == [SONG_KW, SONG_KG]
+    assert lxsync._build_state({"defaultList": [], "loveList": [], "userList": []})[0] == []
+
+
 def test_build_state_counts_legacy_shape_songs():
     """旧形态（无 meta）的歌必须算作可播：实测里整个 374 首的歌单曾被当成 0 首。"""
     legacy = [{"source": "tx", "name": "ethereal", "singer": "inertia.", "interval": "02:24",
