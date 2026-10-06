@@ -1873,6 +1873,56 @@ def media_type_for_ext(ext: str) -> str:
     }.get(ext.lower(), "application/octet-stream")
 
 
+_AUDIO_MAGIC = (
+    (b"fLaC", "flac"),
+    (b"OggS", "ogg"),
+    (b"MAC ", "ape"),
+    (b"wvpk", "wv"),
+    (b"DSD ", "dsf"),
+    (b"FRM8", "dff"),
+)
+
+
+def _sniff_audio_ext(first: bytes) -> str | None:
+    """从**字节**判断容器格式；认不出来返回 None（绝不瞎猜）。
+
+    为什么不能只信 content-type：网易云 CDN 对 FLAC 也常回 `audio/mpeg`，musicbox 的
+    URL 载荷也把容器放在 `type` 而不是 `ext`。结果是「FLAC 声明成 MP3」，按 MIME 选
+    解码器的播放器会一直转圈（用户实测症状）。
+    """
+    if not first:
+        return None
+    head = bytes(first[:16])
+    for magic, ext in _AUDIO_MAGIC:
+        if head.startswith(magic):
+            return ext
+    if len(head) >= 12 and head[4:8] == b"ftyp":
+        return "m4a"
+    if len(head) >= 12 and head[0:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head.startswith(b"ID3"):
+        return "mp3"
+    if head[0] == 0xFF and (head[1] & 0xE0) == 0xE0:
+        return "mp3"           # 无 ID3 的 MP3 帧同步
+    return None
+
+
+def _starts_at_zero(resp: httpx.Response, range_header: str | None) -> bool:
+    """响应是否从文件第 0 字节开始（只有这时字节头才代表整首的容器）。"""
+    if resp.status_code == 200:
+        return True
+    return (range_header or "").strip().lower().startswith("bytes=0-")
+
+
+def _hls_segment_media(filename: str) -> str:
+    """HLS 分片 MIME：音频流不能用 video/*（部分播放器见到 video 就整段不播）。"""
+    if filename == tc.INIT_NAME:
+        return "audio/mp4"
+    if filename.endswith(".m4s"):
+        return "audio/iso.segment"
+    return "application/octet-stream"
+
+
 def ext_from_content_type(content_type: str) -> str:
     ct = (content_type or "").lower()
     if "flac" in ct:
@@ -4299,6 +4349,12 @@ def stream_tee_response(
     for key in ("content-type", "content-length", "content-range"):
         if resp.headers.get(key):
             headers[key] = resp.headers[key]
+    # 容器格式以**字节**为准（见 _sniff_audio_ext）：CDN 的 content-type 经常是 audio/mpeg
+    # 而实际是 FLAC；只信它就会把无损标成 MP3，播放器解码不出来只能一直转圈。
+    if _starts_at_zero(resp, range_header):
+        sniffed = _sniff_audio_ext(first_chunk)
+        if sniffed:
+            resolved_ext = sniffed
     if resolved_ext:
         headers["content-type"] = media_type_for_ext(resolved_ext)
     length = resp.headers.get("content-length", "")
@@ -5881,8 +5937,8 @@ async def track_hls(request: Request, guid: str, filename: str = "preset.m3u8"):
             return Response(content=tc.playlist_text(sess), media_type="application/vnd.apple.mpegurl")
         path = await tc.wait_file(os.path.join(sess.directory, filename), sess, timeout=30.0)
         if path:
-            media = "audio/mp4" if filename == tc.INIT_NAME else "video/iso.segment"
-            return serve_file_with_range(path, request.headers.get("range"), media)
+            return serve_file_with_range(path, request.headers.get("range"),
+                                         _hls_segment_media(filename))
         return JSONResponse(content={"code": 404, "msg": "segment unavailable", "data": None}, status_code=404)
 
     if filename != "preset.m3u8":

@@ -402,7 +402,8 @@ def test_hls_transcode_full_flow(env, fake_ffmpeg):
 
         seg = client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/00000.m4s")
         assert seg.status_code == 200
-        assert seg.headers["content-type"].startswith("video/iso.segment")
+        # 音频 fMP4 分片不能用 video/*：部分播放器见到就整段不播
+        assert seg.headers["content-type"].startswith("audio/iso.segment")
 
         assert client.get(f"/music/api/v1/track/hls/{FAKE_KUWO}/evil.mp4").status_code == 404
 

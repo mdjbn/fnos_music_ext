@@ -593,7 +593,9 @@ def test_stream_online_guid_range_and_tee_cache(monkeypatch):
         assert resp.headers.get("content-length") == content_len
 
         # 检查落盘到飞牛曲库目录：歌名 - id.ext + 同名 .lrc
-        cache_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.mp3")
+        # 扩展名按**字节**判定（这段 mock 以 RIFF/WAVE 开头）——以前只信上游 content-type
+        # （audio/mpeg）会把 WAV 内容存成 .mp3，播放器拿到就是「解不开」。
+        cache_file = os.path.join(CONF["library_dir"], "周杰伦 - 晴天.wav")
         assert os.path.exists(cache_file)
         assert "228908" not in os.path.basename(cache_file)
         with open(cache_file, "rb") as f:
