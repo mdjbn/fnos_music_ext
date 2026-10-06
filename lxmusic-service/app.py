@@ -621,7 +621,25 @@ _CHAIN_RETRY_SECONDS = 30
 # 还会按音质模式再逐档发一次，一首故障曲很容易被计成 3+ 次失败 ⇒ 直接打开 600s 熔断，
 # 之后**所有**曲目 0.07s 返回 `user source circuit open`（用户看到"成片跳曲"）。
 _CHAIN_FAIL_DEDUPE_SECONDS = 60.0
+# 熔断打开期间**只降级不拒绝**：旧行为是 `_chain_acquire` 失败即 `break`，于是用户连跳
+# 几首本来就不可播的曲子把熔断打开后，**整库**（含原本能播的）都在 0.07s 内失败，
+# 播放器表现为"加载时间很短就直接下一曲"。降级 = 仍去解析，但每档预算压到该值，
+# 任何一次成功（含"解析出来但媒体不可用"之外的干净成功）立即闭合熔断。
+_CHAIN_DEGRADED_TIMEOUT = 4.0
 _CHAIN_HEALTH: dict[str, dict] = {}
+
+
+def _is_source_outage(exc: Exception) -> bool:
+    """区分"源级故障"与"单曲级内容失败"。
+
+    `SourceError("resolve", "脚本未返回有效的 http 直链")` 是单曲级：曲库里的 VIP/下架/
+    地区限制曲目、脚本上游对这首歌查不到，都不说明源本身挂了；用户连跳几首这样的曲子
+    不该把整库打成熔断。真正代表源不健康的是解析超时（脚本/上游卡死）、`init`（bridge
+    未就绪）与传输层异常。
+    """
+    if isinstance(exc, SourceError):
+        return exc.category != "resolve" or "直链" not in str(exc)
+    return True
 
 
 def _chain_available(name: str) -> bool:
@@ -647,10 +665,14 @@ def _chain_acquire(name: str) -> bool:
     return True
 
 
-def _chain_report(name: str, ok: bool, key: str = "") -> None:
+def _chain_report(name: str, ok: bool, key: str = "", counts: bool = True) -> None:
     """记账一次链路结果。key = 曲目标识：同一首歌在窗口内只计一次失败。
 
-    half-open 试探失败仍必须计数（`was_half_open` 跳过去重），否则熔断窗口无法续期。
+    - half-open 试探失败仍必须计数（`was_half_open` 跳过去重），否则熔断窗口无法续期；
+    - `counts=False` 用于单曲级内容失败（脚本没给出直链）：不计数也不续期，但同样
+      释放 half_open 名额，避免试探名额被永久占住；
+    - 熔断打开期间**非试探**请求的失败不再累计（否则源持续故障或误判时窗口会被一次次
+      续期到无限），窗口由 `open_until` 自己到期，降级尝试只负责"成功即闭合"。
     """
     h = _CHAIN_HEALTH.setdefault(name, {"fails": 0, "open_until": 0.0, "breaks": 0})
     was_half_open = h.pop("half_open", False)
@@ -660,7 +682,11 @@ def _chain_report(name: str, ok: bool, key: str = "") -> None:
         h.pop("fail_key", None)
         h.pop("fail_ts", None)
         return
+    if not counts:
+        return
     now = time.time()
+    if not was_half_open and now < float(h.get("open_until") or 0):
+        return
     if (not was_half_open and key and h.get("fail_key") == key
             and now - float(h.get("fail_ts") or 0) < _CHAIN_FAIL_DEDUPE_SECONDS):
         return
@@ -841,14 +867,16 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
         if quality is None:
             attempted.append(t)
             continue
-        if not _chain_acquire("user_source"):
-            _record_failure(ChainTransportError("user source circuit open"))
-            break
-        recovering = bool(_CHAIN_HEALTH.get("user_source", {}).get("half_open"))
+        # 熔断打开时不再拒绝（旧行为：整库 0.07s 秒失败 = 成片跳曲），改为降级短预算再试。
+        # `probe` = 本轮拿到"正常 / 半开试探"名额；只有它的失败才允许记账，降级尝试只
+        # 负责"成功即闭合"，不续期窗口。
+        probe = _chain_acquire("user_source")
+        budget = (CONF["resolver_timeout"] if probe
+                  else min(CONF["resolver_timeout"], _CHAIN_DEGRADED_TIMEOUT))
         result = None
         try:
             url = await runtime.music_url(
-                music_info, quality, platform=src, timeout=CONF["resolver_timeout"]
+                music_info, quality, platform=src, timeout=budget
             )
             result = await _verify_result(client, {"url": url}, report_transport=True)
         except asyncio.CancelledError:
@@ -857,12 +885,16 @@ async def _resolve_and_probe(client: httpx.AsyncClient, src: str, item: dict,
             raise
         except Exception as exc:  # transport, timeout, or script rejection
             _record_failure(exc)
-            # 按曲去重：同一首歌换档位重试（以及 proxy 侧再逐档发一次）只算一次失败
-            _chain_report("user_source", False, key=f"{src}:{identifier}")
+            if probe:
+                # 按曲去重：同一首歌换档位重试（以及 proxy 侧再逐档发一次）只算一次失败；
+                # 单曲级"脚本没给出直链"（VIP/下架/地区限制）不算源级故障。
+                _chain_report("user_source", False, key=f"{src}:{identifier}",
+                              counts=_is_source_outage(exc))
         else:
             # A clean resolve without usable media is not a source outage.
-            # A late pre-open request must not close a circuit opened by siblings.
-            if recovering or not _CHAIN_HEALTH.get("user_source", {}).get("open_until"):
+            # 降级期间要求真拿到可播媒体才闭合，避免"解析出来但媒体已死"的凑合结果把
+            # 故障源提前判活；半开试探/正常路径的干净解析照旧直接闭合。
+            if probe or result:
                 _chain_report("user_source", True)
         if result:
             result["resolver"] = "user_source"

@@ -429,10 +429,12 @@ def test_track_url_music_info_carries_platform_keys(isolated):
 # ------------------------------------------------------------------ 熔断 ---
 
 def test_circuit_opens_after_consecutive_failures(isolated):
-    """连续 3 首**不同**曲目解析失败 → 打开熔断（第 4 次起跳过）。
+    """连续 3 首**不同**曲目解析失败 → 打开熔断；此后**降级**而非拒绝。
 
     W14 起失败按曲去重：同一首歌反复重试（含逐档降级、以及 proxy 侧逐档再请求）只算
     一次失败，见 `test_lx_reliability.py::test_same_track_retries_count_once`。
+    W14/D 起熔断打开只把每档预算压到 `_CHAIN_DEGRADED_TIMEOUT`：第 4、5 次仍会去
+    解析（`len(rt.calls) == 5`），不再整库 0.07s 秒失败（用户看到的"成片跳曲"）。
     """
     rt = FakeRuntime(resolver=SourceError("resolve", "boom"))
     isolated._runtime = rt
@@ -453,11 +455,100 @@ def test_circuit_opens_after_consecutive_failures(isolated):
     import asyncio
 
     asyncio.run(run())
-    assert len(rt.calls) == 3  # 第 4、5 次被熔断跳过
+    assert len(rt.calls) == 5  # 降级仍逐曲尝试（旧行为是被熔断直接跳过）
     snap = lxapp.chain_health_snapshot()
     assert snap["user_source"]["open"] is True
     assert snap["user_source"]["breaks"] == 1
     assert snap["user_source"]["state"] == "open"
+
+
+def test_content_level_no_link_does_not_trip_circuit(isolated):
+    """单曲"脚本没给出直链"（VIP/下架/地区限制）是内容级失败，不计入源级熔断。
+
+    用户连跳几首本来就不可播的曲子（自动下一曲）不该把整库打成熔断——这正是
+    "原本可以播放的音乐也会直接下一曲"的成因。
+    """
+    rt = FakeRuntime(resolver=SourceError("resolve", "脚本未返回有效的 http 直链"))
+    isolated._runtime = rt
+
+    async def run():
+        http = mock_client(lambda r: httpx.Response(404))
+        try:
+            for n in range(5):
+                try:
+                    await lxapp.resolve_and_probe(
+                        http, "kw", {"id": f"lx:kw:{n}", "title": "t", "duration_s": 200}
+                    )
+                except lxapp.ChainTransportError:
+                    pass
+        finally:
+            await http.aclose()
+
+    asyncio.run(run())
+    assert len(rt.calls) == 5
+    snap = lxapp.chain_health_snapshot()
+    assert snap["user_source"]["fails"] == 0
+    assert snap["user_source"]["open"] is False
+
+
+def test_content_failure_releases_half_open_claim(isolated):
+    """counts=False 不计数、不续期，但仍要释放 half_open 名额（否则熔断永久卡住）。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + lxapp._CHAIN_OPEN_SECONDS - 31, "breaks": 1,
+    }
+    assert lxapp._chain_acquire("user_source") is True
+    before = lxapp._CHAIN_HEALTH["user_source"]["open_until"]
+    lxapp._chain_report("user_source", False, key="lx:kw:1", counts=False)
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert "half_open" not in h
+    assert h["fails"] == 0 and h["open_until"] == before
+
+
+def test_circuit_open_degrades_to_short_budget_instead_of_rejecting(isolated):
+    """熔断打开期间仍逐曲尝试（降级短预算），失败原因不再是 `circuit open` 哨兵。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 0, "open_until": time.time() + 300, "breaks": 1,
+    }
+    rt = FakeRuntime(resolver=SourceError("resolve", "script exploded"))
+    isolated._runtime = rt
+
+    async def run():
+        http = mock_client(lambda r: httpx.Response(404))
+        seen = []
+        try:
+            for n in range(2):
+                try:
+                    await lxapp.resolve_and_probe(
+                        http, "kw", {"id": f"lx:kw:{n}", "title": "t", "duration_s": 200}
+                    )
+                except lxapp.ChainTransportError as exc:
+                    seen.append(str(exc))
+        finally:
+            await http.aclose()
+        return seen
+
+    seen = asyncio.run(run())
+    assert len(rt.calls) == 2, "熔断期间仍应尝试解析，而不是直接拒绝"
+    assert seen and all("circuit open" not in s for s in seen)
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert h["open_until"] > time.time() + 290, "降级尝试不得续期或重置熔断窗口"
+
+
+def test_degraded_success_closes_circuit(isolated):
+    """降级期间真拿到可播媒体 ⇒ 立即闭合熔断（自愈，不必干等 570s 试探窗口）。"""
+    lxapp._CHAIN_HEALTH["user_source"] = {
+        "fails": 2, "open_until": time.time() + 300, "breaks": 1,
+    }
+    isolated._runtime = FakeRuntime()  # 默认返回 https://media.test/a.flac
+    lxapp.app.state.http = mock_client(_media_handler())
+
+    result = asyncio.run(lxapp.resolve_and_probe(
+        lxapp.app.state.http, "kw", {"id": "lx:kw:228908", "title": "晴天", "duration_s": 269}
+    ))
+    assert result and result.get("url")
+    h = lxapp._CHAIN_HEALTH["user_source"]
+    assert h["open_until"] == 0.0 and h["fails"] == 0
+    assert lxapp.chain_health_snapshot()["user_source"]["open"] is False
 
 
 def test_circuit_recovery_on_open_expiry(isolated):
