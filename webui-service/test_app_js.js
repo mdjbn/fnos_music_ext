@@ -239,6 +239,22 @@ test("网易账号歌单开关：loadConfig 回填 + collectConfig 收集", asyn
   assert.strictEqual(els.get("#netease-my-playlists").checked, false);
 });
 
+test("网易频道歌单开关：loadConfig 回填 + collectConfig 收集（默认关）", async () => {
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_NETEASE_CHANNELS_ENABLED: "true" } });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-channels-enabled").checked, true);
+  els.get("#netease-channels-enabled").checked = false;
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_CHANNELS_ENABLED, false);
+  // 缺省（老配置里没有这个键）必须表现为未勾选：总闸默认关
+  reset();
+  enqueue("/app/fnmusic-ext/api/config", { values: {} });
+  await global.loadConfig();
+  assert.strictEqual(els.get("#netease-channels-enabled").checked, false);
+  els.get("#netease-channels-enabled").checked = true;
+  assert.strictEqual(global.collectConfig().FNMUSIC_NETEASE_CHANNELS_ENABLED, true);
+});
+
 test("自动下载歌词开关：loadConfig 回填 + collectConfig 收集", async () => {
   reset();
   enqueue("/app/fnmusic-ext/api/config", { values: { FNMUSIC_LYRIC_AUTO_DL: "true" } });

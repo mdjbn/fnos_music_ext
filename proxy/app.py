@@ -199,6 +199,10 @@ CONF = {
     # 网易账号歌单注入（2.6.0）：默认关；需网易盒子启用并扫码登录，
     # 音乐页在热门推荐与官方歌单之间展示账号自建歌单（只读，不回写网易）
     "netease_my_playlists": os.environ.get("FNMUSIC_NETEASE_MY_PLAYLISTS", "false").lower() in ("true", "1", "yes"),
+    # 网易频道歌单注入（2.6.4）：默认关。榜单/分类/新碟是公开口径，不需要登录，
+    # 所以必须有独立总闸——否则什么都没开也会被注入十几张歌单。
+    "netease_channels_enabled": os.environ.get("FNMUSIC_NETEASE_CHANNELS_ENABLED", "false").lower()
+    in ("true", "1", "yes"),
     "cover_enrich": os.environ.get("FNMUSIC_COVER_ENRICH", "true").lower() in ("true", "1", "yes"),
     "env_watch": os.environ.get("FNMUSIC_ENV_WATCH", "true").lower() in ("true", "1", "yes"),
     # 官方端点取证：未拦截的 /music/api 请求首见 INFO、之后每 50 次采样一条；
@@ -514,6 +518,7 @@ _ENV_WATCH_KEYS: dict[str, tuple[str, str]] = {
     "FNMUSIC_RECOMMEND_HOT": ("recommend_hot", "bool"),
     "FNMUSIC_RECOMMEND_DAILY": ("recommend_daily", "bool"),
     "FNMUSIC_NETEASE_MY_PLAYLISTS": ("netease_my_playlists", "bool"),
+    "FNMUSIC_NETEASE_CHANNELS_ENABLED": ("netease_channels_enabled", "bool"),
     "FNMUSIC_COVER_ENRICH": ("cover_enrich", "bool"),
     "FNMUSIC_TRACE_FORWARD": ("trace_forward", "bool"),
     "FNMUSIC_TRANSCODE_ENABLED": ("transcode_enabled", "bool"),
@@ -732,11 +737,19 @@ def _lx_netease_guid(guid: str) -> str:
 def _netease_playlists_on() -> bool:
     """网易云歌单（账号/频道）数据是否可取。
 
-    音乐盒进程按「音源三选一」只在该音源下运行；「音乐页显示网易账号歌单」开关打开时
-    WebUI 会让它作为**附加音源**在洛雪/网盘音源下也常驻，所以该开关也算可用——否则
-    洛雪音源下账号/频道歌单永远取不到，连缓存的曲目都会因源不可用而播不了。
+    音乐盒进程按「音源三选一」只在该音源下运行；「音乐页显示网易账号歌单」
+    或新的「音乐页显示网易频道歌单」开关打开时，WebUI 会让它作为**附加音源**
+    在洛雪/网盘音源下也常驻，所以这两个开关也算可用——否则洛雪音源下账号/频道
+    歌单永远取不到，连缓存的曲目都会因源不可用而播不了。
+
+    注意这里只管「数据能不能取」；到底注不注入账号歌单、频道歌单，另有各自的
+    总闸（``CONF["netease_my_playlists"]`` / ``playlists.channels_master_enabled()``）。
     """
-    return bool(CONF.get("netease_enabled")) or bool(CONF.get("netease_my_playlists"))
+    return (
+        bool(CONF.get("netease_enabled"))
+        or bool(CONF.get("netease_my_playlists"))
+        or bool(CONF.get("netease_channels_enabled"))
+    )
 
 
 def _source_enabled(guid: str) -> bool:
@@ -3693,9 +3706,9 @@ async def ext_playlists_preview():
             "track_count": 0,
         })
     channel_recs: list[dict] = []
-    # 与歌单列表同一门控：账号歌单开关打开时洛雪/网盘音源下音乐盒仍常驻，
-    # 频道歌单照常可取；开关关掉且音源不是网易云时不列（预览要如实反映实际注入结果）
-    if _netease_playlists_on():
+    # 与歌单列表同一门控：盒子在跑（或被保活）且「音乐页显示网易频道歌单」总闸开着
+    # 才列出频道歌单；否则预览要如实反映「实际一张都不会注入」。
+    if _netease_playlists_on() and playlists.channels_master_enabled():
         try:
             channel_recs, _keep, _complete = await _channel_playlist_records(client)
         except Exception as exc:  # noqa: BLE001 - 预览接口不该 500
@@ -3737,8 +3750,11 @@ async def ext_playlists_preview():
 async def ext_playlists_warm():
     """手动预热按钮（W6）：刷新当前口径下所有频道歌单的曲目缓存。"""
     if not _netease_playlists_on():
-        # 频道歌单只能由 musicbox 提供，且只有账号歌单开关打开时它才在洛雪/网盘下常驻
+        # 频道歌单只能由 musicbox 提供，且只有两个网易云歌单开关之一打开时它才在
+        # 洛雪/网盘下常驻
         return {"ok": True, "data": {"started": False, "reason": "netease_disabled"}}
+    if not playlists.channels_master_enabled():
+        return {"ok": True, "data": {"started": False, "reason": "channels_disabled"}}
     client = get_musicbox_client(app)
     try:
         recs, keep, complete = await _channel_playlist_records(client)
@@ -8099,12 +8115,13 @@ async def playlist_list(request: Request):
     # _netease_playlists_on），所以不再要求当前音源就是网易云。
     nm_on = bool(CONF.get("netease_my_playlists"))
     # W6 频道歌单（榜/分类/我的/新碟/电台）：SWR 内存缓存，上游不可用时返回空表。
-    # 数据由 musicbox 提供：音源不是它且账号歌单开关关着时它没在跑，硬拉只会白等一轮
-    # （用户报「用洛雪音源时网易云歌单一直加载不出来」）；开关打开时它被保活，照常注入。
+    # 两道门：①数据可取（_netease_playlists_on：盒子在跑或会被保活）
+    # ②「音乐页显示网易频道歌单」总闸打开——榜单/分类是公开口径，不设总闸就会在
+    # 用户什么都没开的情况下被注入（实测：默认就冒出 8 榜 + 8 华语）。
     channel_recs: list[dict] = []
     keep: set[str] = set()
     complete = False
-    if _netease_playlists_on():
+    if _netease_playlists_on() and playlists.channels_master_enabled():
         try:
             channel_recs, keep, complete = await _channel_playlist_records(get_musicbox_client(request.app))
             if complete:

@@ -76,9 +76,13 @@ def wired(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_DIR", str(tmp_path / "tc"))
     monkeypatch.setenv("FNMUSIC_PLAYLIST_TRACK_CACHE_TTL", "3600")
     monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "toplist")
+    # 频道歌单总闸（默认关）：本文件测的是缓存/预热，得显式打开，
+    # 否则「网易云音源在跑」也不再注入频道歌单。
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", "true")
     monkeypatch.delenv("FNMUSIC_NETEASE_PLAYLIST_ORDER", raising=False)
     # 频道歌单由音乐盒提供：当前音源不是网易云时整体不注入（见 playlist_list 门控）
     monkeypatch.setitem(CONF, "netease_enabled", True)
+    monkeypatch.setitem(CONF, "netease_channels_enabled", True)
     pl._reset_live_env_cache_for_test()
     app.state.upstream_client = httpx.AsyncClient(
         transport=httpx.MockTransport(upstream_handler), base_url="http://unix")

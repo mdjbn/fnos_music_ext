@@ -26,10 +26,14 @@ def _req(path: str = "/music/api/v1/playlist/list") -> Request:
 
 
 def _sources(monkeypatch, *, lx: bool = False, netease: bool = False,
-             my_playlists: bool = False) -> None:
+             my_playlists: bool = False, channels: bool = False) -> None:
     monkeypatch.setitem(CONF, "lx_enabled", lx)
     monkeypatch.setitem(CONF, "netease_enabled", netease)
     monkeypatch.setitem(CONF, "netease_my_playlists", my_playlists)
+    monkeypatch.setitem(CONF, "netease_channels_enabled", channels)
+    # 频道口径还多一道「音乐页显示网易频道歌单」总闸 + 勾选列表
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", "true" if channels else "false")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "toplist,category")
 
 
 def _stub_playlist_plumbing(monkeypatch) -> None:
@@ -57,18 +61,21 @@ def test_netease_playlists_on_truth_table(monkeypatch):
     assert appmod._netease_playlists_on() is False
     _sources(monkeypatch, lx=True, my_playlists=True)
     assert appmod._netease_playlists_on() is True, "附加音源：洛雪音源 + 账号歌单开关"
+    _sources(monkeypatch, lx=True, channels=True)
+    assert appmod._netease_playlists_on() is True, "附加音源：洛雪音源 + 频道歌单开关"
     _sources(monkeypatch, netease=True)
     assert appmod._netease_playlists_on() is True
     _sources(monkeypatch, lx=True, my_playlists=False)
-    assert appmod._netease_playlists_on() is False, "开关关掉后洛雪音源下没有数据源"
+    assert appmod._netease_playlists_on() is False, "两个开关都关掉后洛雪音源下没有数据源"
 
 
 def test_netease_tracks_playable_under_lx_with_switch_on(monkeypatch):
     """网易云 guid 的可播判定跟着开关走（音乐盒被保活时才放行）。"""
     _sources(monkeypatch, lx=True, my_playlists=True)
     assert appmod._source_enabled("online:netease:3348197008") is True
+    _sources(monkeypatch, lx=True, channels=True)
+    assert appmod._source_enabled("online:netease:3348197008") is True, "只有频道歌单开关也能听"
     _sources(monkeypatch, lx=True, my_playlists=False)
-    assert appmod._source_enabled("online:netease:3348197008") is False
     assert appmod._source_enabled("online:netease:3348197008") is False
 
 
@@ -79,7 +86,7 @@ def test_netease_tracks_playable_under_lx_with_switch_on(monkeypatch):
 
 @pytest.mark.anyio
 async def test_playlist_list_fetches_channels_under_lx_when_switch_on(monkeypatch):
-    _sources(monkeypatch, lx=True, my_playlists=True)
+    _sources(monkeypatch, lx=True, my_playlists=True, channels=True)
     pulled = []
 
     async def fake_channels(client):
@@ -91,6 +98,28 @@ async def test_playlist_list_fetches_channels_under_lx_when_switch_on(monkeypatc
     resp = await appmod.playlist_list(_req())
     assert resp.status_code == 200
     assert pulled, "开关打开时音乐盒被保活，洛雪音源下也要注入频道歌单"
+
+
+@pytest.mark.anyio
+async def test_playlist_list_skips_channels_under_lx_when_master_off(monkeypatch):
+    """账号歌单开关打开（音乐盒在跑）但没开频道歌单总闸 ⇒ 频道歌单一张都不注入。
+
+    用户反馈原话：「使用网易云音源时，不开启网易云音乐歌单，也不开启洛雪歌单，
+    但是歌单中会有几个榜的歌单和几个华语歌单」——公开口径以前没有总闸。
+    """
+    _sources(monkeypatch, lx=True, my_playlists=True, channels=False)
+
+    async def fake_channels(client):
+        raise AssertionError("频道歌单总闸没开就不该去拉")
+
+    async def fake_peek(client):
+        return []
+
+    _stub_playlist_plumbing(monkeypatch)
+    monkeypatch.setattr(appmod, "_channel_playlist_records", fake_channels)
+    monkeypatch.setattr(appmod.nmpl, "peek_summaries", fake_peek)
+    resp = await appmod.playlist_list(_req())
+    assert resp.status_code == 200
 
 
 @pytest.mark.anyio
@@ -142,7 +171,7 @@ async def test_playlist_list_skips_account_playlists_under_lx_without_switch(mon
 
 @pytest.mark.anyio
 async def test_preview_lists_channels_under_lx_when_switch_on(monkeypatch):
-    _sources(monkeypatch, lx=True, my_playlists=True)
+    _sources(monkeypatch, lx=True, my_playlists=True, channels=True)
     pulled = []
 
     async def fake_logged_in():
@@ -182,8 +211,16 @@ async def test_warm_endpoint_disabled_under_lx_without_switch(monkeypatch):
 
 
 @pytest.mark.anyio
+async def test_warm_endpoint_reports_channels_disabled_when_master_off(monkeypatch):
+    """频道歌单总闸关着：数据源在跑也不预热（理由要与「源不可用」区分开）。"""
+    _sources(monkeypatch, lx=True, my_playlists=True, channels=False)
+    out = await appmod.ext_playlists_warm()
+    assert out["data"] == {"started": False, "reason": "channels_disabled"}
+
+
+@pytest.mark.anyio
 async def test_warm_endpoint_runs_under_lx_with_switch_on(monkeypatch):
-    _sources(monkeypatch, lx=True, my_playlists=True)
+    _sources(monkeypatch, lx=True, my_playlists=True, channels=True)
     called = []
 
     async def fake_channels(client):

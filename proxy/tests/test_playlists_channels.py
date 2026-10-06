@@ -93,6 +93,18 @@ def test_display_name_prefixes():
 # ===========================================================================
 
 
+@pytest.fixture(autouse=True)
+def channels_master_on(monkeypatch):
+    """默认打开「音乐页显示网易频道歌单」总闸。
+
+    本文件测的是**频道口径本身**（勾了哪些、顺序、缓存、登录态过滤），不是总闸；
+    总闸默认关（``channels_master_enabled()`` 见同名用例），不显式打开的话
+    ``channels_enabled()`` 一律返回空、所有用例都会假失败。想测「总闸关」的用例
+    在函数体内自己 ``monkeypatch.setenv(..., "false")`` 覆盖即可。
+    """
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", "true")
+
+
 @pytest.fixture
 def registry_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("FNMUSIC_PLAYLIST_CACHE_DIR", str(tmp_path / "plc"))
@@ -184,6 +196,41 @@ async def test_login_required_channels_absent_when_logged_out(registry_dir, monk
     # 连上游都不该去打（明知未登录还去请求，纯属白跑一趟并拖慢列表）
     assert c.calls == []
     assert keep == set() and complete is False, "未登录时清单不完整，不得据此清理注册表"
+
+
+@pytest.mark.anyio
+async def test_channels_master_switch_off_injects_nothing(registry_dir, monkeypatch):
+    """总闸关闭 ⇒ 一个频道歌单都不注入，且不去打上游。
+
+    回归背景（用户反馈）：「不开启网易云音乐歌单、也不开启洛雪歌单，但歌单里还是
+    有几个榜的歌单和几个华语歌单」——toplist/category 是公开口径（needs_login=False），
+    默认勾选里就含它们，所以以前只要网易云音源开着就会被注入。
+    """
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", "false")
+    assert pl.channels_master_enabled() is False
+    assert pl.channels_enabled() == (), "总闸关时勾选列表不该生效"
+    c = _FakeClient({"/api/v1/playlists/toplists": {"ok": True, "data": [
+        {"playlist_id": 1, "name": "飙升榜", "cover_url": ""}]},
+        "/api/v1/playlists/category": {"ok": True, "data": [
+            {"playlist_id": 11, "name": "华语热单", "cover_url": ""}]}})
+    recs, keep, complete = await pl.collect_records(c, logged_in=True)
+    assert recs == []
+    assert c.calls == [], "总闸关时连一次上游请求都不该发"
+    assert keep == set() and complete is True, "总闸关是「配置如此」，不据此清理注册表"
+
+
+def test_channels_master_defaults_off(monkeypatch):
+    """缺省（老配置里没有这个键）必须是关：升级后不能凭空多出十几张歌单。"""
+    monkeypatch.delenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", raising=False)
+    assert pl.channels_master_enabled() is False
+    assert pl.channels_enabled() == ()
+    for raw in ("", "  ", "off", "0", "no", "false"):
+        monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", raw)
+        assert pl.channels_master_enabled() is False, f"{raw!r} 不该被当成开"
+    for raw in ("1", "true", "TRUE", " yes ", "on"):
+        monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", raw)
+        assert pl.channels_master_enabled() is True, f"{raw!r} 应被当成开"
 
 
 @pytest.mark.anyio

@@ -1646,7 +1646,9 @@ pre.log{background:var(--bg);border:1px solid var(--line);border-radius:8px;padd
             <label class="ck"><input type="checkbox" data-ch="fm">私人FM</label>
           </span>
           <input type="hidden" name="netease_channels" value="">
-          <span class="ht">勾哪些就往飞牛歌单列表注入哪些；需登录的口径未登录时自动不显示。每日推荐由上面的开关单独控制</span>
+          <span class="ht">先在控制台（新界面）音源页打开「音乐页显示网易频道歌单」总闸，这里勾选的才会注入
+            （「我的歌单」还要「音乐页显示网易账号歌单」）。需登录的口径未登录时自动不显示；
+            每日推荐由上面的开关单独控制</span>
         </label>
 
         <label><span class="lb">每口径注入上限</span>

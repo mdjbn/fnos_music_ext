@@ -249,6 +249,21 @@ def apply_explicit_order(items: list[dict]) -> list[dict]:
     return apply_explicit_order_with(items, explicit_order_tokens())
 
 
+def channels_master_enabled() -> bool:
+    """「音乐页显示网易频道歌单」开关：**频道歌单（toplist/category/…）的总闸**。
+
+    默认关闭。排行榜、分类、新碟这些公开口径**不需要登录**，所以光看
+    ``FNMUSIC_NETEASE_CHANNELS`` 的默认值 ``mine,toplist,category`` 会在用户
+    什么都没开的情况下往音乐页塞十几张歌单（实测反馈：8 个「榜｜…」+ 8 个
+    「华语｜…」）。这个总闸与「音乐页显示网易账号歌单」各管一摊：
+    账号歌单开关只管 mine/nm，本开关只管其余频道口径；两个都关就一张都不注入。
+
+    与 `my_playlists_enabled` 一样直接读 os.environ（管理页保存后热生效）。
+    """
+    raw = str(os.environ.get("FNMUSIC_NETEASE_CHANNELS_ENABLED", "false") or "false")
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 def channels_enabled() -> tuple[str, ...]:
     """管理页勾选的口径。除 daily 外都在这里生效；daily 由 recommend.py 单独控制。
 
@@ -256,6 +271,10 @@ def channels_enabled() -> tuple[str, ...]:
     飞牛歌单列表里的顺序由此决定，且必须稳定：不能因为用户先勾了排行榜
     就跑到我的歌单前面去。
     """
+    if not channels_master_enabled():
+        # 总闸关闭：一个频道歌单都不注入。勾选列表原样保留（这里是只读判断），
+        # 用户随时打开总闸即可恢复。
+        return ()
     raw = (os.environ.get("FNMUSIC_NETEASE_CHANNELS") or "").strip()
     if not raw:
         # 未配置、或被手工编辑成空串，一律按默认口径。

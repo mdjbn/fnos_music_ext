@@ -91,6 +91,7 @@ SCHEMA: dict[str, dict] = {
     "FNMUSIC_SEARCH_TIMEOUT": {"kind": "int", "default": "15", "min": 1, "max": 60, "group": "search", "reload": "hot", "label": "搜索超时时间"},
     "FNMUSIC_SEARCH_PROBE": {"kind": "bool", "default": "false", "group": "search", "reload": "hot", "label": "逐曲探活(beta)"},
     "FNMUSIC_NETEASE_MY_PLAYLISTS": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易账号歌单"},
+    "FNMUSIC_NETEASE_CHANNELS_ENABLED": {"kind": "bool", "default": "false", "group": "source", "reload": "hot", "label": "网易频道歌单"},
 }
 
 _PROVIDER_KEYS = set(PROVIDERS.values())
@@ -206,15 +207,21 @@ _preview_until: dict[str, float] = {}
 PROVIDER_PROGRAM = {"musicdl": "musicdl", "musicbox": "musicbox", "lxmusic": "lxmusic"}
 PROVIDER_HEALTH = {"musicdl": CONF["musicdl_url"], "musicbox": CONF["musicbox_url"], "lxmusic": CONF["lx_url"]}
 
-# 「音乐页显示网易账号歌单」同时是**附加音源开关**：洛雪/网盘音源下也把音乐盒进程
-# 常驻，否则账号歌单没人去拉（音乐盒本身是停的）。关掉即回收这份内存。
-NETEASE_AUX_KEY = "FNMUSIC_NETEASE_MY_PLAYLISTS"
+# 「音乐页显示网易账号歌单」与「音乐页显示网易频道歌单」同时是**附加音源开关**：
+# 洛雪/网盘音源下也把音乐盒进程常驻，否则这两类歌单没人去拉（音乐盒本身是停的）。
+# 关掉两者即回收这份内存。频道歌单（榜单/分类）虽然不需要登录，但数据同样只由
+# 音乐盒提供，所以它单独打开时也要保活。
+NETEASE_AUX_KEYS = ("FNMUSIC_NETEASE_MY_PLAYLISTS", "FNMUSIC_NETEASE_CHANNELS_ENABLED")
 NETEASE_AUX_PROGRAM = "musicbox"
 
 
 def netease_aux_needed(values: dict[str, str]) -> bool:
-    """账号歌单开关打开、且当前音源不是音乐盒 ⇒ 需要把音乐盒当附加进程常驻。"""
-    if str(values.get(NETEASE_AUX_KEY, "false")).strip().lower() not in ("true", "1", "yes"):
+    """任一网易歌单开关打开、且当前音源不是音乐盒 ⇒ 需要把音乐盒当附加进程常驻。"""
+    on = any(
+        str(values.get(key, "false")).strip().lower() in ("true", "1", "yes")
+        for key in NETEASE_AUX_KEYS
+    )
+    if not on:
         return False
     return current_provider(values) not in ("", NETEASE_AUX_PROGRAM)
 
@@ -453,7 +460,7 @@ async def api_status(request: Request):
     aux = netease_aux_needed(values)
     for name, base in (("musicdl", CONF["musicdl_url"]), ("musicbox", CONF["musicbox_url"]),
                        ("lxmusic", CONF["lx_url"])):
-        # 附加音源（账号歌单）在洛雪/网盘音源下也常驻，照样探活
+        # 附加音源（网易账号/频道歌单开关）在洛雪/网盘音源下也常驻，照样探活
         if name in PROVIDERS and name != provider and not (name == NETEASE_AUX_PROGRAM and aux):
             services[name] = {"reachable": False, "note": "未启用（按需未启动）"}
             continue
@@ -461,7 +468,7 @@ async def api_status(request: Request):
         entry = {"reachable": ok, "detail": data if ok else data.get("error", "")}
         if name == NETEASE_AUX_PROGRAM and aux:
             entry["aux"] = True
-            entry["note"] = "附加常驻（音乐页显示网易账号歌单）"
+            entry["note"] = "附加常驻（音乐页显示网易账号/频道歌单）"
         services[name] = entry
     lx_source = None
     if provider == "lxmusic":

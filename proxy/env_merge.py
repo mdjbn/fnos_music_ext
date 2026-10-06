@@ -50,6 +50,9 @@ NEW_DEFAULTS: "list[tuple[str, str]]" = [
     ("FNMUSIC_LOCAL_FIRST_CELLULAR_LOSSY_ONLY", "true"),
     ("FNMUSIC_PREFETCH_NEXT", "true"),
     ("FNMUSIC_PREFETCH_MAX_QUEUE", "2"),
+    # 频道歌单总闸：默认关。榜单/分类是公开口径（不需要登录），默认勾选里就含
+    # toplist,category，不设总闸用户什么都没开也会被注入十几张歌单（2.6.4 修复）。
+    ("FNMUSIC_NETEASE_CHANNELS_ENABLED", "false"),
     ("FNMUSIC_NETEASE_CHANNELS", "mine,toplist,category"),
     ("FNMUSIC_NETEASE_CHANNEL_LIMIT", "8"),
     ("FNMUSIC_NETEASE_CATEGORY", "华语"),

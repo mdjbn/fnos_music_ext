@@ -701,6 +701,22 @@ def test_netease_my_playlists_defaults_and_saves(env_file):
         assert again.json()["values"]["FNMUSIC_NETEASE_MY_PLAYLISTS"] == "true"
 
 
+def test_netease_channels_switch_defaults_and_saves(env_file):
+    """频道歌单总闸：默认必须关（否则升级后凭空多出十几张歌单），且能保存。"""
+    with authed_client() as client:
+        view = client.get("/api/config")
+        assert view.json()["values"]["FNMUSIC_NETEASE_CHANNELS_ENABLED"] == "false"
+        meta = view.json()["schema"]["FNMUSIC_NETEASE_CHANNELS_ENABLED"]
+        assert meta["kind"] == "bool" and meta["reload"] == "hot"
+        saved = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_CHANNELS_ENABLED": True}})
+        assert saved.status_code == 200
+        assert "FNMUSIC_NETEASE_CHANNELS_ENABLED" in saved.json()["changed"]
+        assert saved.json()["actions"] == []
+    assert "FNMUSIC_NETEASE_CHANNELS_ENABLED='true'" in env_file.read_text(encoding="utf-8")
+    with authed_client() as client:
+        assert client.get("/api/config").json()["values"]["FNMUSIC_NETEASE_CHANNELS_ENABLED"] == "true"
+
+
 # ------------------------------------------------------------------ 网关管理员 ---
 
 def test_api_requires_admin(env_file):
@@ -873,9 +889,20 @@ AUX_ENV = AUX_ENV.replace(
 )
 assert AUX_ENV.count("FNMUSIC_LX_ENABLED") == 1 and AUX_ENV.count("FNMUSIC_NETEASE_MY_PLAYLISTS") == 1
 
+# 只开「频道歌单」总闸（账号歌单开关关着）——同样要保活音乐盒
+AUX_CHANNELS_ENV = BASE_ENV.replace("FNMUSIC_NETEASE_ENABLED='true'", "FNMUSIC_NETEASE_ENABLED='false'")
+AUX_CHANNELS_ENV = AUX_CHANNELS_ENV.replace("FNMUSIC_LX_ENABLED='false'", "FNMUSIC_LX_ENABLED='true'")
+AUX_CHANNELS_ENV = AUX_CHANNELS_ENV.replace(
+    "FNMUSIC_MUSICDL_ENABLED='false'",
+    "FNMUSIC_MUSICDL_ENABLED='false'\nFNMUSIC_NETEASE_CHANNELS_ENABLED='true'",
+)
+assert AUX_CHANNELS_ENV.count("FNMUSIC_LX_ENABLED") == 1
+assert AUX_CHANNELS_ENV.count("FNMUSIC_NETEASE_CHANNELS_ENABLED") == 1
+assert "FNMUSIC_NETEASE_MY_PLAYLISTS=" not in AUX_CHANNELS_ENV
+
 
 def test_netease_aux_needed_truth_table():
-    """只有「开关打开 + 音源不是音乐盒」才需要附加常驻。"""
+    """只要「任一网易歌单开关打开 + 音源不是音乐盒」就需要附加常驻。"""
     def values(**kw):
         base = {"FNMUSIC_NETEASE_ENABLED": "false", "FNMUSIC_LX_ENABLED": "true",
                 "FNMUSIC_MUSICDL_ENABLED": "false"}
@@ -884,10 +911,17 @@ def test_netease_aux_needed_truth_table():
 
     assert webui.netease_aux_needed(values(FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is True
     assert webui.netease_aux_needed(values(FNMUSIC_NETEASE_MY_PLAYLISTS="false")) is False
+    # 频道歌单开关单独打开也保活（榜单/分类的数据同样只有音乐盒能给）
+    assert webui.netease_aux_needed(values(FNMUSIC_NETEASE_CHANNELS_ENABLED="true")) is True
+    assert webui.netease_aux_needed(values(
+        FNMUSIC_NETEASE_MY_PLAYLISTS="false", FNMUSIC_NETEASE_CHANNELS_ENABLED="false")) is False
     # 音源就是音乐盒：它本来就常驻，不算附加
     assert webui.netease_aux_needed(values(
         FNMUSIC_LX_ENABLED="false", FNMUSIC_NETEASE_ENABLED="true",
         FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is False
+    assert webui.netease_aux_needed(values(
+        FNMUSIC_LX_ENABLED="false", FNMUSIC_NETEASE_ENABLED="true",
+        FNMUSIC_NETEASE_CHANNELS_ENABLED="true")) is False
     # 一个音源都没启用（三选一校验会拦住保存）：不伺候
     assert webui.netease_aux_needed(values(
         FNMUSIC_LX_ENABLED="false", FNMUSIC_NETEASE_MY_PLAYLISTS="true")) is False
@@ -914,6 +948,38 @@ def test_turning_account_playlists_off_releases_musicbox(env_file, svctl):
         r = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_MY_PLAYLISTS": "false"}})
         assert r.status_code == 200
     assert ("stop", "musicbox") in svctl.calls
+
+
+def test_switch_to_lx_with_channel_playlists_keeps_musicbox(env_file, svctl):
+    """只开「频道歌单」总闸切到洛雪：音乐盒也要作为附加音源保活。"""
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {
+            "FNMUSIC_NETEASE_ENABLED": "false",
+            "FNMUSIC_LX_ENABLED": "true",
+            "FNMUSIC_NETEASE_CHANNELS_ENABLED": "true",
+        }})
+        assert r.status_code == 200
+    assert ("stop", "musicbox") not in svctl.calls
+    assert ("start", "lxmusic") in svctl.calls
+    assert ("start", "musicbox") in svctl.calls
+
+
+def test_turning_channel_playlists_off_releases_musicbox(env_file, svctl):
+    """频道歌单开关关掉、账号歌单开关也关着 ⇒ 回收附加的 musicbox。"""
+    env_file.write_text(AUX_CHANNELS_ENV, encoding="utf-8")
+    with authed_client() as client:
+        r = client.put("/api/config", json={"values": {"FNMUSIC_NETEASE_CHANNELS_ENABLED": "false"}})
+        assert r.status_code == 200
+    assert ("stop", "musicbox") in svctl.calls
+
+
+def test_release_keeps_musicbox_while_the_other_switch_is_on(env_file, svctl):
+    """两个开关是「或」的关系：关掉账号歌单但频道歌单还开着，不能把音乐盒停掉。"""
+    env_file.write_text(AUX_ENV, encoding="utf-8")
+    webui.release_netease_aux({**webui.read_env(),
+                               "FNMUSIC_NETEASE_MY_PLAYLISTS": "false",
+                               "FNMUSIC_NETEASE_CHANNELS_ENABLED": "true"})
+    assert ("stop", "musicbox") not in svctl.calls
 
 
 def test_release_keeps_musicbox_while_previewing(env_file, svctl):

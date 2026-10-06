@@ -24,9 +24,13 @@ def _req(path: str = "/music/api/v1/track/stream") -> Request:
                     "path": path, "query_string": b"", "server": ("test", 1), "scheme": "http"})
 
 
-def _sources(monkeypatch, *, lx: bool, netease: bool) -> None:
+def _sources(monkeypatch, *, lx: bool, netease: bool, channels: bool = False) -> None:
     monkeypatch.setitem(CONF, "lx_enabled", lx)
     monkeypatch.setitem(CONF, "netease_enabled", netease)
+    # 频道歌单还多一道「音乐页显示网易频道歌单」总闸（默认关）
+    monkeypatch.setitem(CONF, "netease_channels_enabled", channels)
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS_ENABLED", "true" if channels else "false")
+    monkeypatch.setenv("FNMUSIC_NETEASE_CHANNELS", "toplist")
 
 
 def _stub_playlist_plumbing(monkeypatch) -> None:
@@ -188,7 +192,7 @@ async def test_playlist_list_skips_channel_fetch_without_netease(monkeypatch):
 
 @pytest.mark.anyio
 async def test_playlist_list_fetches_channels_with_netease(monkeypatch):
-    _sources(monkeypatch, lx=False, netease=True)
+    _sources(monkeypatch, lx=False, netease=True, channels=True)
     pulled = []
 
     async def fake_channels(client):
@@ -205,3 +209,29 @@ async def test_playlist_list_fetches_channels_with_netease(monkeypatch):
     resp = await appmod.playlist_list(_req("/music/api/v1/playlist/list"))
     assert resp.status_code == 200
     assert pulled, "网易云音源下频道歌单照旧注入"
+
+
+@pytest.mark.anyio
+async def test_playlist_list_skips_channels_when_master_switch_off(monkeypatch):
+    """网易云音源在跑，但没开「音乐页显示网易频道歌单」⇒ 一张频道歌单都不注入。
+
+    这正是用户反馈的「不开启网易云音乐歌单、也不开启洛雪歌单，歌单里却有几个榜的
+    歌单和几个华语歌单」：榜单/分类是公开口径，以前只要有网易云音源就会被注入。
+    """
+    _sources(monkeypatch, lx=False, netease=True, channels=False)
+    pulled = []
+
+    async def fake_channels(client):
+        pulled.append(client)
+        raise AssertionError("总闸没开就不该去拉频道歌单")
+
+    async def fake_auth(request, client):
+        return True, "user-a", None
+
+    monkeypatch.setattr(appmod, "_channel_playlist_records", fake_channels)
+    monkeypatch.setattr(appmod, "_probe_upstream_auth", fake_auth)
+    monkeypatch.setattr(appmod, "_recommend_injectable_kinds", lambda _g: ())
+    _stub_playlist_plumbing(monkeypatch)
+    resp = await appmod.playlist_list(_req("/music/api/v1/playlist/list"))
+    assert resp.status_code == 200
+    assert not pulled
